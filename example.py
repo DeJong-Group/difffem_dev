@@ -119,7 +119,7 @@ class Example:
         degree=2,
         resolution=(200, 12),
         mesh="tri",
-        poisson_ratio=0.5,
+        poisson_ratio=0.3,
         E=25.0e9,
         load=(1.0, 0),
         lr=1.0e-3,
@@ -164,7 +164,7 @@ class Example:
             self._geo = vertex_position_field.make_deformed_geometry(relative=False)
 
         # make sure positions are differentiable
-        self._vertex_positions.requires_grad = True
+        # self._vertex_positions.requires_grad = True
 
         # Store initial node positions (for rendering)
         self._u_space = fem.make_polynomial_space(self._geo, degree=degree, dtype=wp.vec2)
@@ -207,41 +207,18 @@ class Example:
         )
         fem.normalize_dirichlet_projector(u_left_bd_matrix)
         self._bd_projector = u_left_bd_matrix
-
-        
-        # # Lame coefficients from Young modulus and Poisson ratio
-
-        # E_space = fem.make_polynomial_space(self._geo, degree=0, dtype=float)
-        # self._E_field = fem.make_discrete_field(space=E_space)
-        # self._E_field.dof_values = wp.zeros(shape=E_space.node_count(), dtype=float, requires_grad=True)*E_array[0] #* E_space.node_count()#wp.array(np.zeros(E_space.node_count())+E_array, dtype=float, requires_grad=True)
-        # self._E_field.dof_values.requires_grad = True
-        # self._nu = 0.3
-        # print(self._E_field.dof_values.numpy())
-
-        # E_array: wp.array(shape=(1,), requires_grad=True)
         
         self.E_space = fem.make_polynomial_space(self._geo, degree=0, dtype=float)
         
-
-        # Fill it
         self.tape = wp.Tape()
 
-        
-        self._nu = 0.3
-
-        # self._lame = wp.array(1.0 / (1.0 + poisson_ratio) * np.array([poisson_ratio / (1.0 - poisson_ratio), 0.5]), dtype=float, requires_grad=True)
+        self._nu = poisson_ratio
         self._load = wp.array([load[0], load[1]], dtype=float, requires_grad=True)
-        # # self._load = load
-        # self._lame.requires_grad=True
         self._load.requires_grad=True
-
 
         self._u_right_test = fem.make_test(space=self._u_space, domain=self._right)
 
-        # initialize renderer
-        self.renderer = fem_example_utils.Plot()
 
-        
 
         # forward ################################################################################################
 
@@ -252,7 +229,7 @@ class Example:
 
         E_space_meas = fem.make_polynomial_space(self._geo, degree=0, dtype=float)
         self._E_field_meas = fem.make_discrete_field(space=E_space_meas)
-        self._E_field_meas.dof_values = wp.array(np.zeros((E_space_meas.node_count()))+25e9, dtype=float, requires_grad=True)
+        self._E_field_meas.dof_values = wp.array(np.zeros((E_space_meas.node_count()))+25.0e9, dtype=float, requires_grad=True)
         self._E_field_meas.dof_values.requires_grad = True
         print(self._E_field_meas.dof_values.numpy())
 
@@ -286,7 +263,7 @@ class Example:
         
         self.strain_space_meas = fem.make_polynomial_space(
             self._geo,
-            degree=2,
+            degree=1,
             dtype=wp.mat22,   # tensor type
         )
         self.strain_field_meas = self.strain_space_meas.make_field()
@@ -369,22 +346,6 @@ class Example:
 
         self.tape.record_func(solve_linear_system, arrays=(u_rhs, u_est))
 
-        # self.strain_space = fem.make_polynomial_space(
-        #     self._geo,
-        #     degree=2,
-        #     dtype=wp.mat22,   # tensor type
-        # )
-        # self.strain_field = self.strain_space.make_field()
-        # self.strain_field.dof_values.requires_grad = True    
-
-        # with self.tape:
-        #     # Interpolate the strain (ε = sym(grad(u)))
-        #     fem.interpolate(
-        #         strain_integrand,
-        #         dest=self.strain_field,
-        #         fields={"u": self._u_field},
-        #     )
-
         # Evaluate residual
         # Integral of squared difference between simulated position and target positions
         loss = wp.empty(shape=1, dtype=wp.float32, requires_grad=True)
@@ -396,13 +357,6 @@ class Example:
                 domain=self._u_test.domain,
                 output=loss,
             )
-            # fem.integrate(
-            #     loss_strain2,
-            #     fields={"strain_meas": self.strain_field_meas, "strain_est": self.strain_field},
-            #     domain=self._u_test.domain,
-            #     output=loss,
-            # )
-
 
 
         # perform backward step
@@ -418,6 +372,14 @@ class Example:
         grad = self.E_array.grad.numpy()
         self.tape.zero()
         print("loss", loss, grad)
+
+        self.strain_field = self.strain_space_meas.make_field()
+        fem.interpolate(
+                strain_integrand,
+                dest=self.strain_field,
+                fields={"u": self._u_field},
+            )
+
         return loss.numpy(), grad
 
     def render(self):
@@ -437,13 +399,14 @@ class Example:
 
 
 with wp.ScopedDevice(None):
+    resolution = (200, 12)
     example = Example(
         quiet=True,
         degree=1,
         resolution=(200, 12),
         mesh="quad",
         poisson_ratio=0.3,
-        load=wp.vec2(2.0e5*1.0e10, 0),
+        load=wp.vec2(2.0e5*1.0, 0),
         lr=1.0e25,
     )
 
@@ -466,86 +429,125 @@ with wp.ScopedDevice(None):
                         jac=True,
                         hess='2-point',
                         #   callback=callback_fn,
-                        bounds=[(1e8, 1e11) for b in range(n_params)],
+                        # bounds=[(1.0e8, 1.0e11) for b in range(n_params)],
                         options=options)
         print(result)
-    # for _k in range(1):
-    #     loss = example.step()
-    
 
-    # example_est = Example(
-    #     quiet=True,
-    #     degree=1,
-    #     resolution=(200, 12),
-    #     mesh="quad",
-    #     poisson_ratio=0.3,
-    #     load=wp.vec2(2.0e5, 0),
-    #     lr=1.0e-3,
-    #     strain_meas=example.strain_field,
-    #     u_meas=example._u_field,
-    # )
+# plotting
+import matplotlib.pyplot as plt
+fig, axes = plt.subplots(7, 1, figsize=(16, 20))
 
-    # for _k in range(1):
-    #     example_est.step()
+deformation_scale=10000
+# Get data
+node_positions = example._u_space.node_positions().numpy()
+disp_meas = example._u_field_meas.dof_values.numpy()
+disp_est = example._u_field.dof_values.numpy()
+strain_meas = example.strain_field_meas.dof_values.numpy()
+strain_est = example.strain_field.dof_values.numpy()
 
-    #     example.renderer.plot(options={"displacement": {"displacement": {}}, "rest": {"displacement": {}}})
+disp_min = np.min((np.min(disp_meas[:,0]), np.min(disp_est[:,0])))
+disp_max = np.max((np.max(disp_meas[:,0]), np.max(disp_est[:,0])))
+strain_min = np.min((np.min(strain_meas[:,0]), np.min(strain_est[:,0])))
+strain_max = np.max((np.max(strain_meas[:,0]), np.max(strain_est[:,0])))
+# 1.
+# Deformed positions
 
-    # if optim == 'lbfgs':
-    # from scipy.optimize import minimize
-    # import time
-    # t1 = time.time()
-    # grad_tracker =[]
-    # n_ef_it = 1
-    # E_hist = []
-    # it_hist = []
+deformed_pos = node_positions + deformation_scale * disp_meas
+ax = axes[0]
+x = node_positions[:, 0]
+y = node_positions[:, 1]
+ax.scatter(x, y, c='blue', s=1, alpha=0.3, label='Original')
+# Deformed shape
+x_def = deformed_pos[:, 0]
+y_def = deformed_pos[:, 1]
+ax.scatter(x_def, y_def, c='red', s=1, alpha=0.5, label=f'Deformed (×{deformation_scale})')
+ax.set_xlabel('x (m)')
+ax.set_ylabel('y (m)')
+ax.set_title('True Deformed Shape', fontweight='bold')
+# ax.legend()
+ax.grid(True, alpha=0.3)
+ax.set_aspect('equal')
 
-    # def compute_loss_and_grad(params):
-    #     print(params)
-    #     grid_v_in.fill(0)
-    #     grid_m_in.fill(0)
-    #     loss[None] = 0
+# 2. X Displacement
+ax = axes[1]
+disp_mag = disp_meas[:,0]  # mm
+scatter = ax.scatter(node_positions[:, 0], node_positions[:, 1],
+                    c=disp_mag, cmap='jet', s=10, vmin=disp_min, vmax=disp_max)
+cbar = plt.colorbar(scatter, ax=ax)
+cbar.set_label('X Displacement (m)')
+ax.set_xlabel('x (m)')
+ax.set_ylabel('y (m)')
+ax.set_title('True X Displacement', fontweight='bold')
+ax.set_aspect('equal')
+ax.grid(True, alpha=0.3)
 
-    #     for i in range(n_blocks):
-    #         E_block[i] = params[i]
-    #     with ti.ad.Tape(loss=loss):
-    #         assign_E()
-    #         assign_ext_load()
-    #         for s in range(steps - 1):
-    #             substep(s)
-    #         calc_disp()
-    #         compute_loss()
+ax = axes[2]
+disp_mag = disp_est[:,0]  # mm
+scatter = ax.scatter(node_positions[:, 0], node_positions[:, 1],
+                    c=disp_mag, cmap='jet', s=10, vmin=disp_min, vmax=disp_max)
+cbar = plt.colorbar(scatter, ax=ax)
+cbar.set_label('Displacement (m)')
+ax.set_xlabel('x (m)')
+ax.set_ylabel('y (m)')
+ax.set_title('Estimated X Displacement', fontweight='bold')
+ax.set_aspect('equal')
+ax.grid(True, alpha=0.3)
 
-    #     loss_val = loss[None]
-    #     grad_val = [E_block.grad[i] for i in range(n_blocks)]
-    #     losses.append(loss_val)
+# 3. Displacement Diff
+ax = axes[3]
+disp_mag = (disp_meas - disp_est)[:, 0]
+scatter = ax.scatter(node_positions[:, 0], node_positions[:, 1],
+                    c=disp_mag, cmap='jet', s=10)#, vmin=0.7e-5, vmax=1.3e-5)
+cbar = plt.colorbar(scatter, ax=ax)
+cbar.set_label('Displacement (m)')
+ax.set_xlabel('x (m)')
+ax.set_ylabel('y (m)')
+ax.set_title('Displacement Difference', fontweight='bold')
+ax.set_aspect('equal')
+ax.grid(True, alpha=0.3)
 
-    #     # print(grad_val)
-    #     # print(loss_val)
 
-    #     return loss_val, grad_val
-    
+# 4. X strain
+ax = axes[4]
+print(strain_est.shape)
+print(node_positions.shape)
+disp_mag = strain_meas[:,0,0]  # mm
+scatter = ax.scatter(node_positions[:, 0], node_positions[:, 1],
+                    c=disp_mag, cmap='jet', s=10, vmin=strain_min, vmax=strain_max)
+cbar = plt.colorbar(scatter, ax=ax)
+cbar.set_label('Strain')
+ax.set_xlabel('x (m)')
+ax.set_ylabel('y (m)')
+ax.set_title('True X Strain', fontweight='bold')
+ax.set_aspect('equal')
+ax.grid(True, alpha=0.3)
 
-    # init_e = 25e9*0.12
+ax = axes[5]
+disp_mag = strain_est[:,0,0]  # mm
 
-    # initial_params = []
-    # for i in range(n_particles):
-    #     initial_params.append(init_e)
-    # E_hist.append(initial_params)
+scatter = ax.scatter(node_positions[:, 0], node_positions[:, 1],
+                    c=disp_mag, cmap='jet', s=10, vmin=strain_min, vmax=strain_max)
+cbar = plt.colorbar(scatter, ax=ax)
+cbar.set_label('Strain')
+ax.set_xlabel('x (m)')
+ax.set_ylabel('y (m)')
+ax.set_title('Estimated X Strain', fontweight='bold')
+ax.set_aspect('equal')
+ax.grid(True, alpha=0.3)
 
-    # tol = 1e-16
-    # options = { 
-    #     'ftol': tol, 
-    #     'gtol': tol,
-    #     'tol': tol,
-    #     'adaptive': True
-    #     }
-    
-    
-    # result = minimize(compute_loss_and_grad,
-    #                   np.array([init_e for b in range(n_blocks)]),
-    #                   method='L-BFGS-B',
-    #                   jac=True,
-    #                   hess='2-point',
-    #                 #   callback=callback_fn,
-    #                 bounds=[(1e8, 1e10) for b in range(n_blocks)],
-    #                   options=options)
+# 5. Strain Diff
+
+ax = axes[6]
+disp_mag = (strain_meas - strain_est)[:,0,0]
+scatter = ax.scatter(node_positions[:, 0], node_positions[:, 1],
+                    c=disp_mag, cmap='jet', s=10)#, vmin=0.7e-5, vmax=1.3e-5)
+cbar = plt.colorbar(scatter, ax=ax)
+cbar.set_label('Strain')
+ax.set_xlabel('x (m)')
+ax.set_ylabel('y (m)')
+ax.set_title('Strain Difference', fontweight='bold')
+ax.set_aspect('equal')
+ax.grid(True, alpha=0.3)
+
+
+plt.show()
