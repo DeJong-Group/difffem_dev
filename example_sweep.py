@@ -73,10 +73,29 @@ def hooke_elasticity_form(s: fem.Sample, u: fem.Field, v: fem.Field, E_field: fe
     stress = hooke_stress(fem.D(u, s), lamb, mu)
     return wp.ddot(fem.D(v, s), stress)
 
+@fem.integrand
+def hooke_elasticity_form2(s: fem.Sample, u: fem.Field, v: fem.Field, E: wp.array(dtype=wp.float32), nu: float):
+    E_val = E[0]
+    l = lame_from_E_nu(E_val, nu)
+    lamb = l[0]
+    mu = l[1]
+    stress = hooke_stress(fem.D(u, s), lamb, mu)
+    return wp.ddot(fem.D(v, s), stress)
 
 @fem.integrand
 def applied_load_form(s: fem.Sample, domain: fem.Domain, v: fem.Field, load: wp.array(dtype=wp.float32)):
     return v(s)[0]*load[0] + v(s)[1]*load[1]
+
+@fem.integrand
+def loss_disp(
+    s: fem.Sample, domain: fem.Domain, u: fem.Field, u_meas: fem.Field
+):
+    disp = u(s)
+    disp_meas = u_meas(s)
+    diff = disp - disp_meas
+    stress_norm_sq = 0.5 * wp.dot(diff, diff)
+
+    return stress_norm_sq 
 
 @fem.integrand
 def loss_form(
@@ -85,10 +104,9 @@ def loss_form(
     strain = strain_field(s, u)
     strain_meas = strain_field(s, u_meas)
     diff = strain - strain_meas
-    stress_norm_sq = 0.5 * wp.ddot(diff, diff)
+    stress_norm_sq = 0.5 * wp.ddot(diff, diff) * 1e3
 
     return stress_norm_sq 
-
 
 @fem.integrand
 def loss_strain2(
@@ -210,7 +228,6 @@ class Example:
         
         self.E_space = fem.make_polynomial_space(self._geo, degree=0, dtype=float)
         
-        self.tape = wp.Tape()
 
         self._nu = poisson_ratio
         self._load = wp.array([load[0], load[1]], dtype=float, requires_grad=True)
@@ -238,17 +255,6 @@ class Example:
             fields={"v": self._u_right_test},
             values={"load": self._load},
             output=u_rhs,
-        )
-        # the elastic force will be zero at the first iteration,
-        # but including it on the self.tape is necessary to compute the gradient of the force equilibrium
-        # using the implicit function theorem
-        # Note that this will be evaluated in the backward pass using the updated values for "_u_field"
-        fem.integrate(
-            hooke_elasticity_form,
-            fields={"u": self._u_field_meas, "v": self._u_test, "E_field": self._E_field_meas},
-            values={"nu": -self._nu},
-            output=u_rhs,
-            add=True,
         )
 
         u_matrix_meas = fem.integrate(
@@ -286,6 +292,9 @@ class Example:
         # print(self.E_array)
         # Allocate storage for the repeated field
         vals = wp.zeros(N, dtype=float, requires_grad=True)
+
+        self.tape = wp.Tape()
+
         with self.tape:
             wp.launch(
                 kernel=fill_repeated,
@@ -294,19 +303,23 @@ class Example:
             )
 
         self._E_field = fem.make_discrete_field(space=self.E_space)
+        
+        self._E_field.dof_values = vals
         self._E_field.dof_values.requires_grad = True
-        self._E_field.dof_values = vals   # fully differentiable
+        # self._E_field.dof_values.assign(vals)   # fully differentiable
+        # self._E_field.dof_values.requires_grad = True
 
         self.params = wp.array(self.E_array, dtype=wp.float32).flatten()
         self.params.grad = wp.array(self.E_array.grad, dtype=wp.float32).flatten()
         self.optimizer = Adam([self.params], lr=self.lr)
+
+
         # Forward step, record adjoint self.tape for forces
         u_est = self._u_field.dof_values
         u_est.zero_()
 
         u_rhs = wp.empty(self._u_space.node_count(), dtype=wp.vec2f, requires_grad=True)
 
-        # self.tape = wp.Tape()
 
         with self.tape:
             fem.integrate(
@@ -316,23 +329,38 @@ class Example:
                 output=u_rhs,
             )
             # the elastic force will be zero at the first iteration,
-            # but including it on the self.tape is necessary to compute the gradient of the force equilibrium
+            # but including it on the tape is necessary to compute the gradient of the force equilibrium
             # using the implicit function theorem
             # Note that this will be evaluated in the backward pass using the updated values for "_u_field"
+            # fem.integrate(
+            #     hooke_elasticity_form,
+            #     fields={"u": self._u_field, "v": self._u_test, "E_field": self._E_field},
+            #     values={"nu": -self._nu},
+            #     output=u_rhs,
+            #     add=True,
+            # )
             fem.integrate(
-                hooke_elasticity_form,
-                fields={"u": self._u_field, "v": self._u_test, "E_field": self._E_field},
-                values={"nu": -self._nu},
+                hooke_elasticity_form2,
+                fields={"u": self._u_field, "v": self._u_test},
+                values={"nu": -self._nu, "E": -self.E_array},
                 output=u_rhs,
                 add=True,
             )
 
+
+        # u_matrix = fem.integrate(
+        #     hooke_elasticity_form,
+        #     fields={"u": self._u_trial, "v": self._u_test, "E_field": self._E_field},
+        #     values={"nu": self._nu},
+        #     output_dtype=float,
+        # )
         u_matrix = fem.integrate(
-            hooke_elasticity_form,
-            fields={"u": self._u_trial, "v": self._u_test, "E_field": self._E_field},
-            values={"nu": self._nu},
+            hooke_elasticity_form2,
+                fields={"u": self._u_trial, "v": self._u_test},
+                values={"nu": self._nu, "E": self.E_array},
             output_dtype=float,
         )
+        # print(u_matrix)
         fem.project_linear_system(u_matrix, u_rhs, self._bd_projector, normalize_projector=False)
 
         fem_example_utils.bsr_cg(u_matrix, b=u_rhs, x=u_est, quiet=self._quiet, tol=1e-6, max_iters=1000)
@@ -353,6 +381,7 @@ class Example:
         with self.tape:
             fem.integrate(
                 loss_form,
+                # loss_disp,
                 fields={"u": self._u_field, "u_meas": self._u_field_meas},
                 domain=self._u_test.domain,
                 output=loss,
@@ -382,19 +411,6 @@ class Example:
 
         return loss.numpy(), grad
 
-    def render(self):
-        # Render using fields defined on start geometry
-        # (renderer assumes geometry remains fixed for timesampled fields)
-        u_space = fem.make_polynomial_space(self._start_geo, degree=self._u_space.degree, dtype=wp.vec2)
-        u_field = fem.make_discrete_field(space=u_space)
-        rest_field = fem.make_discrete_field(space=u_space)
-
-        geo_displacement = self._u_space.node_positions() - self._start_node_positions
-        u_field.dof_values = self._u_field.dof_values + geo_displacement
-        rest_field.dof_values = geo_displacement
-
-        self.renderer.add_field("displacement", u_field)
-        self.renderer.add_field("rest", rest_field)
 
 
 
@@ -418,10 +434,9 @@ with wp.ScopedDevice(None):
         loss, grad = example.step([param])
         losses.append(loss)
         grads.append(grad)
-print([np.min(losses), np.max(losses)])
-print(grads)
+
 import matplotlib.pyplot as plt
-fig, axes = plt.subplots(2, 1, figsize=(16, 10))
+fig, axes = plt.subplots(3, 1, figsize=(16, 10))
 
 ax = axes[0]
 ax.plot(param_list, losses)
@@ -439,6 +454,15 @@ ax.set_xlabel('E')
 ax.set_ylabel('Gradient')
 ax.set_title('Gradient Landscape')
 ax.set_ylim([np.min(grads), np.max(grads)])
+
+
+ax = axes[2]
+ax.plot(param_list, np.sign(grads))
+ax.vlines(25e9, -1, 1, color='r')
+ax.set_xlabel('E')
+ax.set_ylabel('Gradient Signs')
+ax.set_title('Gradient Signs')
+# ax.set_ylim([np.min(grads), np.max(grads)])
 # ax.set_yscale('log')
-plt.savefig("sweep.png", dpi=300)
+plt.savefig("sweep4.png", dpi=300)
 plt.show()

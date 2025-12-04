@@ -285,14 +285,14 @@ class Example:
         # Initialize Adam optimizer
         # Current implementation assumes scalar arrays, so cast our vec2 arrays to scalars
         
-        # self.E_array = wp.array([35.0e9], dtype=float, requires_grad=True)
-        # self.params = wp.array(self.E_array, dtype=wp.float32).flatten()
-        # self.params.grad = wp.array(self.E_array.grad, dtype=wp.float32).flatten()
-        # self.optimizer = Adam([self.params], lr=self.lr)
+        self.E_array = wp.array([35.0e9], dtype=float, requires_grad=True)
+        self.params = wp.array(self.E_array, dtype=wp.float32).flatten()
+        self.params.grad = wp.array(self.E_array.grad, dtype=wp.float32).flatten()
+        self.optimizer = Adam([self.params], lr=self.lr)
 
-    def step(self, param):
+    def step(self):
     # def step(self):
-        self.E_array = wp.array(param, dtype=float, requires_grad=True)
+        # self.E_array = wp.array(param, dtype=float, requires_grad=True)
         N = self.E_space.node_count()
         # print(self.E_array)
         # Allocate storage for the repeated field
@@ -397,9 +397,8 @@ class Example:
         # print(self._E_field.dof_values.grad)
 
         # update positions and reset self.tape
-        # self.optimizer.step([self.params.grad])
+        self.optimizer.step([self.params.grad])
         # print(self._E_field.dof_values.numpy())
-        print(self.E_array)
         # print(self.E_array.grad)
         grad = self.E_array.grad.numpy()
         # print("loss", loss, grad)
@@ -413,7 +412,7 @@ class Example:
                 fields={"u": self._u_field},
             )
 
-        return loss.numpy(), #grad
+        return loss.numpy(), self.E_array.numpy()[0]
 
     def render(self):
         # Render using fields defined on start geometry
@@ -440,155 +439,36 @@ with wp.ScopedDevice(None):
         mesh="quad",
         poisson_ratio=0.3,
         load=wp.vec2(2.0e5*10.0, 0),
-        lr=5.0e22,
+        lr=5.0e8,
     )
 
-    optim = "grad"#'lbfgs'
-    optim = 'lbfgs'
-    if optim == 'lbfgs':
-        from scipy.optimize import minimize
-        tol = 1e-16
-        options = { 
-            'ftol': tol, 
-            'gtol': tol,
-            'tol': tol,
-            'maxls' : 100,
-            'eps' : 1.0e9,
-            'finite_diff_rel_step' : 0.1,
-            'adaptive': True
-            }
-        
-        n_params = 1
-        
-        result = minimize(example.step,
-                        np.array([35.0e9]),
-                        method='BFGS',
-                        # jac=True,
-                        jac='3-point',
-                        # hess='2-point',
-                        # bounds=[(1.0e8, 1.0e11) for b in range(n_params)],
-                        options=options)
-        print(result)
-    else:
-        for _ in range(100):
-            example.step()
+    losses = []
+    params = []
+    n_its = 1000
+    from tqdm import tqdm
+    for _ in tqdm(np.arange(n_its)):
+        loss, param = example.step()
+        losses.append(loss)
+        params.append(param)
 
+import matplotlib.pyplot as plt
+fig, axes = plt.subplots(2, 1, figsize=(16, 10))
 
-# # plotting
-# import matplotlib.pyplot as plt
-# fig, axes = plt.subplots(7, 1, figsize=(16, 20))
+ax = axes[0]
+ax.plot(np.arange(n_its), losses)
+# ax.hlines(25e9, 0, 1e1, color='r')
+ax.set_xlabel('Iterations')
+ax.set_ylabel('Loss')
+ax.set_title('Adam Loss Evolution')
+ax.set_yscale('log')
+ax.set_ylim([np.min(losses), np.max(losses)])
 
-# deformation_scale=10000
-# # Get data
-# node_positions = example._u_space.node_positions().numpy()
-# disp_meas = example._u_field_meas.dof_values.numpy()
-# disp_est = example._u_field.dof_values.numpy()
-# strain_meas = example.strain_field_meas.dof_values.numpy()
-# strain_est = example.strain_field.dof_values.numpy()
+ax = axes[1]
+ax.plot(np.arange(n_its), params)
+ax.hlines(25e9, 0, n_its, color='r', alpha=0.4)
+ax.set_xlabel('Iterations')
+ax.set_ylabel('E')
+ax.set_title('Adam Learning Curve')
 
-# disp_min = np.min((np.min(disp_meas[:,0]), np.min(disp_est[:,0])))
-# disp_max = np.max((np.max(disp_meas[:,0]), np.max(disp_est[:,0])))
-# strain_min = np.min((np.min(strain_meas[:,0]), np.min(strain_est[:,0])))
-# strain_max = np.max((np.max(strain_meas[:,0]), np.max(strain_est[:,0])))
-# # 1.
-# # Deformed positions
-
-# deformed_pos = node_positions + deformation_scale * disp_meas
-# ax = axes[0]
-# x = node_positions[:, 0]
-# y = node_positions[:, 1]
-# ax.scatter(x, y, c='blue', s=1, alpha=0.3, label='Original')
-# # Deformed shape
-# x_def = deformed_pos[:, 0]
-# y_def = deformed_pos[:, 1]
-# ax.scatter(x_def, y_def, c='red', s=1, alpha=0.5, label=f'Deformed (×{deformation_scale})')
-# ax.set_xlabel('x (m)')
-# ax.set_ylabel('y (m)')
-# ax.set_title('True Deformed Shape', fontweight='bold')
-# # ax.legend()
-# ax.grid(True, alpha=0.3)
-# ax.set_aspect('equal')
-
-# # 2. X Displacement
-# ax = axes[1]
-# disp_mag = disp_meas[:,0]  # mm
-# scatter = ax.scatter(node_positions[:, 0], node_positions[:, 1],
-#                     c=disp_mag, cmap='jet', s=10, vmin=disp_min, vmax=disp_max)
-# cbar = plt.colorbar(scatter, ax=ax)
-# cbar.set_label('X Displacement (m)')
-# ax.set_xlabel('x (m)')
-# ax.set_ylabel('y (m)')
-# ax.set_title('True X Displacement', fontweight='bold')
-# ax.set_aspect('equal')
-# ax.grid(True, alpha=0.3)
-
-# ax = axes[2]
-# disp_mag = disp_est[:,0]  # mm
-# scatter = ax.scatter(node_positions[:, 0], node_positions[:, 1],
-#                     c=disp_mag, cmap='jet', s=10, vmin=disp_min, vmax=disp_max)
-# cbar = plt.colorbar(scatter, ax=ax)
-# cbar.set_label('Displacement (m)')
-# ax.set_xlabel('x (m)')
-# ax.set_ylabel('y (m)')
-# ax.set_title('Estimated X Displacement', fontweight='bold')
-# ax.set_aspect('equal')
-# ax.grid(True, alpha=0.3)
-
-# # 3. Displacement Diff
-# ax = axes[3]
-# disp_mag = (disp_meas - disp_est)[:, 0]
-# scatter = ax.scatter(node_positions[:, 0], node_positions[:, 1],
-#                     c=disp_mag, cmap='jet', s=10)#, vmin=0.7e-5, vmax=1.3e-5)
-# cbar = plt.colorbar(scatter, ax=ax)
-# cbar.set_label('Displacement (m)')
-# ax.set_xlabel('x (m)')
-# ax.set_ylabel('y (m)')
-# ax.set_title('Displacement Difference', fontweight='bold')
-# ax.set_aspect('equal')
-# ax.grid(True, alpha=0.3)
-
-
-# # 4. X strain
-# ax = axes[4]
-# print(strain_est.shape)
-# print(node_positions.shape)
-# disp_mag = strain_meas[:,0,0]  # mm
-# scatter = ax.scatter(node_positions[:, 0], node_positions[:, 1],
-#                     c=disp_mag, cmap='jet', s=10, vmin=strain_min, vmax=strain_max)
-# cbar = plt.colorbar(scatter, ax=ax)
-# cbar.set_label('Strain')
-# ax.set_xlabel('x (m)')
-# ax.set_ylabel('y (m)')
-# ax.set_title('True X Strain', fontweight='bold')
-# ax.set_aspect('equal')
-# ax.grid(True, alpha=0.3)
-
-# ax = axes[5]
-# disp_mag = strain_est[:,0,0]  # mm
-
-# scatter = ax.scatter(node_positions[:, 0], node_positions[:, 1],
-#                     c=disp_mag, cmap='jet', s=10, vmin=strain_min, vmax=strain_max)
-# cbar = plt.colorbar(scatter, ax=ax)
-# cbar.set_label('Strain')
-# ax.set_xlabel('x (m)')
-# ax.set_ylabel('y (m)')
-# ax.set_title('Estimated X Strain', fontweight='bold')
-# ax.set_aspect('equal')
-# ax.grid(True, alpha=0.3)
-
-# # 5. Strain Diff
-
-# ax = axes[6]
-# disp_mag = (strain_meas - strain_est)[:,0,0]
-# scatter = ax.scatter(node_positions[:, 0], node_positions[:, 1],
-#                     c=disp_mag, cmap='jet', s=10)#, vmin=0.7e-5, vmax=1.3e-5)
-# cbar = plt.colorbar(scatter, ax=ax)
-# cbar.set_label('Strain')
-# ax.set_xlabel('x (m)')
-# ax.set_ylabel('y (m)')
-# ax.set_title('Strain Difference', fontweight='bold')
-# ax.set_aspect('equal')
-# ax.grid(True, alpha=0.3)
-
-
-# plt.show()
+plt.savefig("adam.png", dpi=300)
+plt.show()
