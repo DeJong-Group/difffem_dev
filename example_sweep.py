@@ -287,27 +287,27 @@ class Example:
 
 
     def step(self, param):
-        self.E_array = wp.array(param, dtype=float, requires_grad=True)
         N = self.E_space.node_count()
-        # print(self.E_array)
-        # Allocate storage for the repeated field
-        vals = wp.zeros(N, dtype=float, requires_grad=True)
+        self.E_array = wp.array(param, dtype=float, requires_grad=True)
+        
+        # # print(self.E_array)
+        # # Allocate storage for the repeated field
+        # vals = wp.zeros(N, dtype=float, requires_grad=True)
 
         self.tape = wp.Tape()
 
-        with self.tape:
-            wp.launch(
-                kernel=fill_repeated,
-                dim=N,
-                inputs=[vals, self.E_array],
-            )
+        # with self.tape:
+        #     wp.launch(
+        #         kernel=fill_repeated,
+        #         dim=N,
+        #         inputs=[vals, self.E_array],
+        #     )
 
         self._E_field = fem.make_discrete_field(space=self.E_space)
         
-        self._E_field.dof_values = vals
+        self._E_field.dof_values = self.E_array
         self._E_field.dof_values.requires_grad = True
-        # self._E_field.dof_values.assign(vals)   # fully differentiable
-        # self._E_field.dof_values.requires_grad = True
+
 
         self.params = wp.array(self.E_array, dtype=wp.float32).flatten()
         self.params.grad = wp.array(self.E_array.grad, dtype=wp.float32).flatten()
@@ -426,7 +426,7 @@ with wp.ScopedDevice(None):
         lr=1.0e25,
     )
 
-    param_list = np.linspace(10.0e9, 50.0e9, 401)
+    param_list = np.linspace(10.0e9, 50.0e9, 41)
     losses = []
     grads = []
     from tqdm import tqdm
@@ -444,11 +444,14 @@ ax.vlines(25e9, 0, 1e1, color='r')
 ax.set_xlabel('E')
 ax.set_ylabel('Loss')
 ax.set_title('Loss Landscape')
-ax.set_yscale('log')
+# ax.set_yscale('log')
 ax.set_ylim([np.min(losses), np.max(losses)])
 
 ax = axes[1]
 ax.plot(param_list, grads)
+
+
+
 ax.vlines(25e9, 0, 1e1, color='r')
 ax.set_xlabel('E')
 ax.set_ylabel('Gradient')
@@ -464,5 +467,5 @@ ax.set_ylabel('Gradient Signs')
 ax.set_title('Gradient Signs')
 # ax.set_ylim([np.min(grads), np.max(grads)])
 # ax.set_yscale('log')
-plt.savefig("sweep4.png", dpi=300)
+# plt.savefig("sweep4.png", dpi=300)
 plt.show()
