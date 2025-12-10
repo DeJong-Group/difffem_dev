@@ -205,7 +205,7 @@ class Example:
         damage_idx_start = int(E_space_meas.node_count()*0.5) - resolution[1]//2
         damage_idx_width = int((resolution[1]+1)*2)
         damage_idx = np.arange(damage_idx_start, damage_idx_start+damage_idx_width)
-        E_meas_init[damage_idx] = 24.0e9
+        E_meas_init[damage_idx] = 25.0e9
         
         self._E_field_meas.dof_values = wp.array(E_meas_init, dtype=float, requires_grad=True)
         self._E_field_meas.dof_values.requires_grad = True
@@ -337,10 +337,10 @@ with wp.ScopedDevice(None):
     example = Example(
         quiet=True,
         degree=1,
-        resolution=(200, 12, 12),
+        resolution=(100, 6, 6),
         mesh="quad",
         poisson_ratio=0.3,
-        load=wp.vec3(2.0e5*10.0, 0.0, 0.0),
+        load=wp.vec3(2.0e3*10.0, 0.0, 0.0),
         lr=5.0e8,
     )
 
