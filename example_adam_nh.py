@@ -38,12 +38,12 @@ def classify_boundary_sides(
 
 @wp.func
 def hooke_stress(
-    strain: wp.mat33, 
+    strain: wp.mat22, 
     lamb: wp.float32, 
     mu: wp.float32
 ):
     """Hookean elasticity"""
-    return 2.0 * mu * strain + lamb * wp.trace(strain) * wp.identity(n=3, dtype=float)
+    return 2.0 * mu * strain + lamb * wp.trace(strain) * wp.identity(n=2, dtype=float)
 
 @fem.integrand
 def strain_field(s: fem.Sample, u: fem.Field):
@@ -60,7 +60,7 @@ def hooke_elasticity_form(s: fem.Sample, u: fem.Field, v: fem.Field, E_field: fe
 
 @fem.integrand
 def applied_load_form(s: fem.Sample, domain: fem.Domain, v: fem.Field, load: wp.array(dtype=wp.float32)):
-    return v(s)[0]*load[0] + v(s)[1]*load[1] + v(s)[2]*load[2]
+    return v(s)[0]*load[0] + v(s)[1]*load[1]
 
 @fem.integrand
 def loss_disp(
@@ -90,12 +90,12 @@ class Example:
     def __init__(
         self,
         quiet=False,
-        degree=1,
-        resolution=(200, 12, 12),
+        degree=2,
+        resolution=(200, 12),
         mesh="tri",
         poisson_ratio=0.3,
         E=25.0e9,
-        load=(1.0, 0.0, 0.0),
+        load=(1.0, 0),
         lr=1.0e-3,
         strain_meas = None,
         u_meas = None,
@@ -104,35 +104,35 @@ class Example:
         self.degree = degree
         self.lr = lr
         # procedural rectangular domain definition
-        bounds_lo = wp.vec3(0.0, 0.0, 0.0)
-        bounds_hi = wp.vec3(2.0, 0.12, 0.12)
-        self._initial_volume = (bounds_hi - bounds_lo)[0] * (bounds_hi - bounds_lo)[1] * (bounds_hi - bounds_lo)[2]
+        bounds_lo = wp.vec2(0.0, 0.0)
+        bounds_hi = wp.vec2(2.0, 0.12)
+        self._initial_volume = (bounds_hi - bounds_lo)[0] * (bounds_hi - bounds_lo)[1]
         
         self.strain_meas = strain_meas
         self.u_meas = u_meas
 
         if mesh == "tri":
             # triangle mesh, optimize vertices directly
-            positions, tri_vidx = fem_example_utils.gen_tetmesh(
-                res=wp.vec3i(resolution[0], resolution[1], resolution[2]), bounds_lo=bounds_lo, bounds_hi=bounds_hi
+            positions, tri_vidx = fem_example_utils.gen_trimesh(
+                res=wp.vec2i(resolution[0], resolution[1]), bounds_lo=bounds_lo, bounds_hi=bounds_hi
             )
-            self._geo = fem.Tetmesh(tet_vertex_indices=tri_vidx, positions=positions)
-            # self._start_geo = fem.Tetmesh(tri_vertex_indices=tri_vidx, positions=wp.clone(positions))
+            self._geo = fem.Trimesh2D(tri_vertex_indices=tri_vidx, positions=positions)
+            self._start_geo = fem.Trimesh2D(tri_vertex_indices=tri_vidx, positions=wp.clone(positions))
             self._vertex_positions = positions
         elif mesh == "quad":
             # quad mesh, optimize vertices directly
-            positions, quad_vidx = fem_example_utils.gen_hexmesh(
-                res=wp.vec3i(resolution[0], resolution[1], resolution[2]), bounds_lo=bounds_lo, bounds_hi=bounds_hi
+            positions, quad_vidx = fem_example_utils.gen_quadmesh(
+                res=wp.vec2i(resolution[0], resolution[1]), bounds_lo=bounds_lo, bounds_hi=bounds_hi
             )
-            self._geo = fem.Hexmesh(hex_vertex_indices=quad_vidx, positions=positions)
-            # self._start_geo = fem.Hexmesh(quad_vertex_indices=quad_vidx, positions=wp.clone(positions))
+            self._geo = fem.Quadmesh2D(quad_vertex_indices=quad_vidx, positions=positions)
+            self._start_geo = fem.Quadmesh2D(quad_vertex_indices=quad_vidx, positions=wp.clone(positions))
             self._vertex_positions = positions
         else:
             # grid, optimize nodes of deformation field
-            self._start_geo = fem.Grid3D(
-                wp.vec3i(resolution[0], resolution[1], resolution[2]), bounds_lo=bounds_lo, bounds_hi=bounds_hi
+            self._start_geo = fem.Grid2D(
+                wp.vec2i(resolution[0], resolution[1]), bounds_lo=bounds_lo, bounds_hi=bounds_hi
             )
-            vertex_displacement_space = fem.make_polynomial_space(self._start_geo, degree=degree, dtype=wp.vec3)
+            vertex_displacement_space = fem.make_polynomial_space(self._start_geo, degree=1, dtype=wp.vec2)
             vertex_position_field = fem.make_discrete_field(space=vertex_displacement_space)
             vertex_position_field.dof_values = vertex_displacement_space.node_positions()
             self._geo = vertex_position_field.make_deformed_geometry(relative=False)
@@ -141,7 +141,7 @@ class Example:
         # self._vertex_positions.requires_grad = True
 
         # Store initial node positions (for rendering)
-        self._u_space = fem.make_polynomial_space(self._geo, degree=degree, dtype=wp.vec3)
+        self._u_space = fem.make_polynomial_space(self._geo, degree=degree, dtype=wp.vec2)
         self._start_node_positions = self._u_space.node_positions()
 
         # displacement field, make sure gradient is stored
@@ -156,7 +156,7 @@ class Example:
         self._u_trial = fem.make_trial(space=self._u_space)
 
         # Identify left and right sides for boundary conditions
-        boundary = fem.Sides(self._geo)
+        boundary = fem.BoundarySides(self._geo)
 
         left_mask = wp.zeros(shape=boundary.element_count(), dtype=int)
         right_mask = wp.zeros(shape=boundary.element_count(), dtype=int)
@@ -185,7 +185,7 @@ class Example:
         self.E_space = fem.make_polynomial_space(self._geo, degree=degree, dtype=float)
 
         self._nu = poisson_ratio
-        self._load = wp.array([load[0], load[1], load[2]], dtype=float, requires_grad=True)
+        self._load = wp.array([load[0], load[1]], dtype=float, requires_grad=True)
         self._load.requires_grad=True
 
         self._u_right_test = fem.make_test(space=self._u_space, domain=self._right)
@@ -196,19 +196,18 @@ class Example:
         u = self._u_field_meas.dof_values
         u.zero_()
 
-        u_rhs = wp.empty(self._u_space.node_count(), dtype=wp.vec3f, requires_grad=True)
+        u_rhs = wp.empty(self._u_space.node_count(), dtype=wp.vec2f, requires_grad=True)
 
         E_space_meas = fem.make_polynomial_space(self._geo, degree=degree, dtype=float)
         self._E_field_meas = fem.make_discrete_field(space=E_space_meas)
 
-        E_meas_init = np.arange((E_space_meas.node_count()))*1.0e7+25.0e9
-        # damage_idx_start = int(E_space_meas.node_count()*0.5) - resolution[1]//2
-        # damage_idx_width = int((resolution[1]+1)*2)
-        # damage_idx = np.arange(damage_idx_start, damage_idx_start+damage_idx_width)
-        # E_meas_init[damage_idx] = 25.0e9
+        E_meas_init = np.zeros((E_space_meas.node_count()))*1.0e7+25.0e9
+        damage_idx_start = int(E_space_meas.node_count()*0.5) - resolution[1]//2
+        damage_idx_width = int((resolution[1]+1)*1)
+        damage_idx = np.arange(damage_idx_start, damage_idx_start+damage_idx_width)
+        E_meas_init[damage_idx] = 24.9e9
         
         self._E_field_meas.dof_values = wp.array(E_meas_init, dtype=float, requires_grad=True)
-        
         self._E_field_meas.dof_values.requires_grad = True
 
         fem.integrate(
@@ -230,7 +229,7 @@ class Example:
         self.strain_space_meas = fem.make_polynomial_space(
             self._geo,
             degree=1,
-            dtype=wp.mat33,   # tensor type
+            dtype=wp.mat22,   # tensor type
         )
         self.strain_field_meas = self.strain_space_meas.make_field()
         fem.interpolate(
@@ -244,7 +243,7 @@ class Example:
         # Initialize Adam optimizer
         # Current implementation assumes scalar arrays, so cast our vec2 arrays to scalars
         N = self.E_space.node_count()
-        self.init_E = np.zeros(N)+30.0e9
+        self.init_E = np.zeros(N)+28.0e9
         self.E_array = wp.array(self.init_E, dtype=float, requires_grad=True)
         self.params = wp.array(self.E_array, dtype=wp.float32).flatten()
         self.params.grad = wp.array(self.E_array.grad, dtype=wp.float32).flatten()
@@ -261,7 +260,7 @@ class Example:
         u_est = self._u_field.dof_values
         u_est.zero_()
 
-        u_rhs = wp.empty(self._u_space.node_count(), dtype=wp.vec3f, requires_grad=True)
+        u_rhs = wp.empty(self._u_space.node_count(), dtype=wp.vec2f, requires_grad=True)
 
         with self.tape:
             fem.integrate(
@@ -330,29 +329,29 @@ class Example:
                 fields={"u": self._u_field},
             )
 
-        return loss.numpy(), self.E_array.numpy()
+        return loss.numpy(), self.E_array.numpy()[0]
 
 
 with wp.ScopedDevice(None):
+    resolution = (200, 12)
     example = Example(
         quiet=True,
         degree=1,
-        resolution=(100, 6, 6),
+        resolution=(200, 12),
         mesh="quad",
         poisson_ratio=0.3,
-        load=wp.vec3(2.0e3*10.0, 0.0, 0.0),
+        load=wp.vec2(2.0e5*10.0, 0),
         lr=5.0e8,
     )
 
     losses = []
     params = []
-    n_its = 1000
+    n_its = 200
     from tqdm import tqdm
     for _ in tqdm(np.arange(n_its)):
         loss, param = example.step()
         losses.append(loss)
         params.append(param)
-
 
 import matplotlib.pyplot as plt
 fig, axes = plt.subplots(2, 1, figsize=(16, 10))
@@ -450,56 +449,6 @@ ax.set_title('Estimated Elastic Field', fontweight='bold')
 ax.set_aspect('equal')
 ax.grid(True, alpha=0.3)
 
-plt.savefig("adam_3d_nh_compare.png", dpi=300)
-plt.show()
 
-fig = plt.figure()
-ax = fig.add_subplot(projection='3d')
-scatter = ax.scatter(node_positions[:, 0], node_positions[:, 1], zs=node_positions[:, 2],
-                    c=E_meas, cmap='jet', s=10, vmin=E_min, vmax=E_max)
-cbar = plt.colorbar(scatter, ax=ax)
-cbar.set_label('Young\'s Modulus (Pa)')
-ax.set_xlabel('x (m)')
-ax.set_ylabel('y (m)')
-ax.set_ylabel('z (m)')
-ax.set_title('True Elastic Field', fontweight='bold')
-# ax.set_aspect('equal')
-ax.grid(True, alpha=0.3)
-
-
-plt.savefig("adam_3d_nh_meas.png", dpi=300)
-plt.show()
-
-fig = plt.figure()
-ax = fig.add_subplot(projection='3d')
-scatter = ax.scatter(node_positions[:, 0], node_positions[:, 1], zs=node_positions[:, 2],
-                    c=example.init_E, cmap='jet', s=10, vmin=E_min, vmax=E_max)
-cbar = plt.colorbar(scatter, ax=ax)
-cbar.set_label('Young\'s Modulus (Pa)')
-ax.set_xlabel('x (m)')
-ax.set_ylabel('y (m)')
-ax.set_ylabel('z (m)')
-ax.set_title('Initialized Elastic Field', fontweight='bold')
-# ax.set_aspect('equal')
-ax.grid(True, alpha=0.3)
-
-
-plt.savefig("adam_3d_nh_init.png", dpi=300)
-plt.show()
-
-fig = plt.figure()
-ax = fig.add_subplot(projection='3d')
-scatter = ax.scatter(node_positions[:, 0], node_positions[:, 1], zs=node_positions[:, 2],
-                    c=E_est, cmap='jet', s=10, vmin=E_min, vmax=E_max)
-cbar = plt.colorbar(scatter, ax=ax)
-cbar.set_label('Young\'s Modulus (Pa)')
-ax.set_xlabel('x (m)')
-ax.set_ylabel('y (m)')
-ax.set_ylabel('z (m)')
-ax.set_title('Estimated Elastic Field', fontweight='bold')
-# ax.set_aspect('equal')
-ax.grid(True, alpha=0.3)
-
-
-plt.savefig("adam_3d_nh_est.png", dpi=300)
+plt.savefig("adam_nh_compare.png", dpi=300)
 plt.show()

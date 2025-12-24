@@ -28,12 +28,19 @@ def classify_boundary_sides(
     domain: fem.Domain,
     left: wp.array(dtype=int),
     right: wp.array(dtype=int),
+    x_bound: wp.float32,
 ):
     nor = fem.normal(domain, s)
+    pos = fem.position(domain, s)
 
-    if nor[0] < -0.5:
+    # if nor[0] < -0.5:
+    #     left[s.qp_index] = 1
+    # elif nor[0] > 0.5:
+    #     right[s.qp_index] = 1
+    
+    if pos[0] == 0.0:
         left[s.qp_index] = 1
-    elif nor[0] > 0.5:
+    elif pos[0] == x_bound:
         right[s.qp_index] = 1
 
 @wp.func
@@ -111,6 +118,8 @@ class Example:
         self.strain_meas = strain_meas
         self.u_meas = u_meas
 
+        self.resolution = resolution
+
         if mesh == "tri":
             # triangle mesh, optimize vertices directly
             positions, tri_vidx = fem_example_utils.gen_tetmesh(
@@ -164,12 +173,11 @@ class Example:
         fem.interpolate(
             classify_boundary_sides,
             quadrature=fem.RegularQuadrature(boundary, order=0),
-            values={"left": left_mask, "right": right_mask},
+            values={"left": left_mask, "right": right_mask, "x_bound": bounds_hi[0]},
         )
 
         self._left = fem.Subdomain(boundary, element_mask=left_mask)
         self._right = fem.Subdomain(boundary, element_mask=right_mask)
-
         # Build projectors for the left-side homogeneous Dirichlet condition
         u_left_bd_test = fem.make_test(space=self._u_space, domain=self._left)
         u_left_bd_trial = fem.make_trial(space=self._u_space, domain=self._left)
@@ -185,6 +193,7 @@ class Example:
         self.E_space = fem.make_polynomial_space(self._geo, degree=degree, dtype=float)
 
         self._nu = poisson_ratio
+        self.load = load
         self._load = wp.array([load[0], load[1], load[2]], dtype=float, requires_grad=True)
         self._load.requires_grad=True
 
@@ -201,11 +210,11 @@ class Example:
         E_space_meas = fem.make_polynomial_space(self._geo, degree=degree, dtype=float)
         self._E_field_meas = fem.make_discrete_field(space=E_space_meas)
 
-        E_meas_init = np.arange((E_space_meas.node_count()))*1.0e7+25.0e9
-        # damage_idx_start = int(E_space_meas.node_count()*0.5) - resolution[1]//2
-        # damage_idx_width = int((resolution[1]+1)*2)
-        # damage_idx = np.arange(damage_idx_start, damage_idx_start+damage_idx_width)
-        # E_meas_init[damage_idx] = 25.0e9
+        E_meas_init = np.zeros((E_space_meas.node_count()))*1.0e7+25.0e9
+        damage_idx_start = int(E_space_meas.node_count()*0.5) - ((resolution[1]+1)*(resolution[2]+1))//2
+        damage_idx_width = int((resolution[1]+1)*(resolution[2]+1))
+        damage_idx = np.arange(damage_idx_start, damage_idx_start+damage_idx_width)
+        E_meas_init[damage_idx] = 25.0e9*0.9
         
         self._E_field_meas.dof_values = wp.array(E_meas_init, dtype=float, requires_grad=True)
         
@@ -244,13 +253,18 @@ class Example:
         # Initialize Adam optimizer
         # Current implementation assumes scalar arrays, so cast our vec2 arrays to scalars
         N = self.E_space.node_count()
-        self.init_E = np.zeros(N)+30.0e9
-        self.E_array = wp.array(self.init_E, dtype=float, requires_grad=True)
-        self.params = wp.array(self.E_array, dtype=wp.float32).flatten()
-        self.params.grad = wp.array(self.E_array.grad, dtype=wp.float32).flatten()
-        self.optimizer = Adam([self.params], lr=self.lr)
+        self.init_E = np.zeros(N)+25.0e9
+        # self.E_array = wp.array(self.init_E, dtype=float, requires_grad=True)
+        # self.params = wp.array(self.E_array, dtype=wp.float32).flatten()
+        # self.params.grad = wp.array(self.E_array.grad, dtype=wp.float32).flatten()
+        # self.optimizer = Adam([self.params], lr=self.lr)
+        
+        self.losses = []
+        self.grads = []
+        self.params = []
 
-    def step(self):
+    def step(self, param):
+        self.E_array = wp.array(param, dtype=float, requires_grad=True)
         self.tape = wp.Tape()
 
         self._E_field = fem.make_discrete_field(space=self.E_space)
@@ -318,7 +332,7 @@ class Example:
         self.tape.backward(loss=loss)
 
         # update positions and reset self.tape
-        self.optimizer.step([-self.params.grad])
+        # self.optimizer.step([-self.params.grad])
         grad = -self.E_array.grad.numpy()
         self.tape.zero()
         
@@ -330,7 +344,11 @@ class Example:
                 fields={"u": self._u_field},
             )
 
-        return loss.numpy(), self.E_array.numpy()
+        self.losses.append(loss.numpy())
+        self.grads.append(grad)
+        self.params.append(self.E_array.numpy())
+
+        return loss.numpy(), grad
 
 
 with wp.ScopedDevice(None):
@@ -346,13 +364,33 @@ with wp.ScopedDevice(None):
 
     losses = []
     params = []
-    n_its = 1000
-    from tqdm import tqdm
-    for _ in tqdm(np.arange(n_its)):
-        loss, param = example.step()
-        losses.append(loss)
-        params.append(param)
+    from scipy.optimize import minimize
+    tol = 1e-16
+    options = {
+        'disp' : 1,
+        'ftol': tol, 
+        'gtol': tol,
+        'tol': tol,
+        'maxls' : 100,
+        'eps' : 1.0e9,
+        'finite_diff_rel_step' : 0.1,
+        'adaptive': True
+        }
+    
 
+    N = example.E_space.node_count()
+    result = minimize(example.step,
+                    np.zeros(N)+25.0e6,
+                    
+                    method='L-BFGS-B',
+                    jac=True,
+                    # jac='3-point',
+                    hess='2-point',
+                    # bounds=[(1.0e8, 1.0e11) for b in range(n_params)],
+                    options=options)
+    n_its = len(example.losses)
+    losses = example.losses
+    params = example.params
 
 import matplotlib.pyplot as plt
 fig, axes = plt.subplots(2, 1, figsize=(16, 10))
@@ -373,7 +411,7 @@ ax.set_xlabel('Iterations')
 ax.set_ylabel('E')
 ax.set_title('Adam Learning Curve')
 
-plt.savefig("adam_nh.png", dpi=300)
+plt.savefig("figures/3d_damage.png", dpi=300)
 plt.show()
 
 fig, axes = plt.subplots(4, 1, figsize=(16, 12))
@@ -392,10 +430,12 @@ E_est = example._E_field.dof_values.numpy()
 
 disp_min = np.min((np.min(disp_meas[:,0]), np.min(disp_est[:,0])))
 disp_max = np.max((np.max(disp_meas[:,0]), np.max(disp_est[:,0])))
-strain_min = np.min((np.min(strain_meas[:,0]), np.min(strain_est[:,0])))
-strain_max = np.max((np.max(strain_meas[:,0]), np.max(strain_est[:,0])))
+strain_min = np.min((np.min(strain_meas[:,0,0]), np.min(strain_est[:,0,0])))
+strain_max = np.max((np.max(strain_meas[:,0,0]), np.max(strain_est[:,0,0])))
 E_min = np.min((np.min(E_meas), np.min(E_est), np.min(example.init_E)))
 E_max = np.max((np.max(E_meas), np.max(E_est), np.max(example.init_E)))
+
+
 
 
 # 1.
@@ -450,7 +490,7 @@ ax.set_title('Estimated Elastic Field', fontweight='bold')
 ax.set_aspect('equal')
 ax.grid(True, alpha=0.3)
 
-plt.savefig("adam_3d_nh_compare.png", dpi=300)
+plt.savefig("figures/3d_damage_compare.png", dpi=300)
 plt.show()
 
 fig = plt.figure()
@@ -465,9 +505,9 @@ ax.set_ylabel('z (m)')
 ax.set_title('True Elastic Field', fontweight='bold')
 # ax.set_aspect('equal')
 ax.grid(True, alpha=0.3)
+ax.set_box_aspect([ub - lb for lb, ub in (getattr(ax, f'get_{a}lim')() for a in 'xyz')])
 
-
-plt.savefig("adam_3d_nh_meas.png", dpi=300)
+plt.savefig("figures/3d_damage_meas.png", dpi=300)
 plt.show()
 
 fig = plt.figure()
@@ -482,9 +522,9 @@ ax.set_ylabel('z (m)')
 ax.set_title('Initialized Elastic Field', fontweight='bold')
 # ax.set_aspect('equal')
 ax.grid(True, alpha=0.3)
+ax.set_box_aspect([ub - lb for lb, ub in (getattr(ax, f'get_{a}lim')() for a in 'xyz')])
 
-
-plt.savefig("adam_3d_nh_init.png", dpi=300)
+plt.savefig("figures/3d_damage_init.png", dpi=300)
 plt.show()
 
 fig = plt.figure()
@@ -499,7 +539,7 @@ ax.set_ylabel('z (m)')
 ax.set_title('Estimated Elastic Field', fontweight='bold')
 # ax.set_aspect('equal')
 ax.grid(True, alpha=0.3)
+ax.set_box_aspect([ub - lb for lb, ub in (getattr(ax, f'get_{a}lim')() for a in 'xyz')])
 
-
-plt.savefig("adam_3d_nh_est.png", dpi=300)
+plt.savefig("figures/3d_damage_est.png", dpi=300)
 plt.show()

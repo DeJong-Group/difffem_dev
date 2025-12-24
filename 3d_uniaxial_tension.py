@@ -28,12 +28,19 @@ def classify_boundary_sides(
     domain: fem.Domain,
     left: wp.array(dtype=int),
     right: wp.array(dtype=int),
+    x_bound: wp.float32,
 ):
     nor = fem.normal(domain, s)
+    pos = fem.position(domain, s)
 
-    if nor[0] < -0.5:
+    # if nor[0] < -0.5:
+    #     left[s.qp_index] = 1
+    # elif nor[0] > 0.5:
+    #     right[s.qp_index] = 1
+    
+    if pos[0] == 0.0:
         left[s.qp_index] = 1
-    elif nor[0] > 0.5:
+    elif pos[0] == x_bound:
         right[s.qp_index] = 1
 
 @wp.func
@@ -111,6 +118,8 @@ class Example:
         self.strain_meas = strain_meas
         self.u_meas = u_meas
 
+        self.resolution = resolution
+
         if mesh == "tri":
             # triangle mesh, optimize vertices directly
             positions, tri_vidx = fem_example_utils.gen_tetmesh(
@@ -164,12 +173,11 @@ class Example:
         fem.interpolate(
             classify_boundary_sides,
             quadrature=fem.RegularQuadrature(boundary, order=0),
-            values={"left": left_mask, "right": right_mask},
+            values={"left": left_mask, "right": right_mask, "x_bound": bounds_hi[0]},
         )
 
         self._left = fem.Subdomain(boundary, element_mask=left_mask)
         self._right = fem.Subdomain(boundary, element_mask=right_mask)
-
         # Build projectors for the left-side homogeneous Dirichlet condition
         u_left_bd_test = fem.make_test(space=self._u_space, domain=self._left)
         u_left_bd_trial = fem.make_trial(space=self._u_space, domain=self._left)
@@ -185,6 +193,7 @@ class Example:
         self.E_space = fem.make_polynomial_space(self._geo, degree=degree, dtype=float)
 
         self._nu = poisson_ratio
+        self.load = load
         self._load = wp.array([load[0], load[1], load[2]], dtype=float, requires_grad=True)
         self._load.requires_grad=True
 
@@ -201,7 +210,7 @@ class Example:
         E_space_meas = fem.make_polynomial_space(self._geo, degree=degree, dtype=float)
         self._E_field_meas = fem.make_discrete_field(space=E_space_meas)
 
-        E_meas_init = np.arange((E_space_meas.node_count()))*1.0e7+25.0e9
+        E_meas_init = np.zeros((E_space_meas.node_count()))*1.0e7+25.0e9
         # damage_idx_start = int(E_space_meas.node_count()*0.5) - resolution[1]//2
         # damage_idx_width = int((resolution[1]+1)*2)
         # damage_idx = np.arange(damage_idx_start, damage_idx_start+damage_idx_width)
@@ -337,7 +346,7 @@ with wp.ScopedDevice(None):
     example = Example(
         quiet=True,
         degree=1,
-        resolution=(100, 6, 6),
+        resolution=(100, 12, 12),
         mesh="quad",
         poisson_ratio=0.3,
         load=wp.vec3(2.0e3*10.0, 0.0, 0.0),
@@ -346,12 +355,13 @@ with wp.ScopedDevice(None):
 
     losses = []
     params = []
-    n_its = 1000
+    n_its = 1
     from tqdm import tqdm
     for _ in tqdm(np.arange(n_its)):
         loss, param = example.step()
         losses.append(loss)
         params.append(param)
+
 
 
 import matplotlib.pyplot as plt
@@ -373,8 +383,8 @@ ax.set_xlabel('Iterations')
 ax.set_ylabel('E')
 ax.set_title('Adam Learning Curve')
 
-plt.savefig("adam_nh.png", dpi=300)
-plt.show()
+# plt.savefig("figures/3d_ut.png", dpi=300)
+# plt.show()
 
 fig, axes = plt.subplots(4, 1, figsize=(16, 12))
 
@@ -392,114 +402,123 @@ E_est = example._E_field.dof_values.numpy()
 
 disp_min = np.min((np.min(disp_meas[:,0]), np.min(disp_est[:,0])))
 disp_max = np.max((np.max(disp_meas[:,0]), np.max(disp_est[:,0])))
-strain_min = np.min((np.min(strain_meas[:,0]), np.min(strain_est[:,0])))
-strain_max = np.max((np.max(strain_meas[:,0]), np.max(strain_est[:,0])))
+strain_min = np.min((np.min(strain_meas[:,0,0]), np.min(strain_est[:,0,0])))
+strain_max = np.max((np.max(strain_meas[:,0,0]), np.max(strain_est[:,0,0])))
 E_min = np.min((np.min(E_meas), np.min(E_est), np.min(example.init_E)))
 E_max = np.max((np.max(E_meas), np.max(E_est), np.max(example.init_E)))
 
+P = example.load[0] * example.resolution[1] * example.resolution[2]
+A = example.resolution[1] * example.resolution[2]
+E = np.mean(E_meas)
+theoretical_strain = P / (A * E)
+measured_strain = strain_meas[:, 0, 0]
 
-# 1.
-# Deformed positions
-deformed_pos = node_positions + deformation_scale * disp_meas
-ax = axes[0]
-x = node_positions[:, 0]
-y = node_positions[:, 1]
-ax.scatter(x, y, c='blue', s=1, alpha=0.3, label='Original')
-# Deformed shape
-x_def = deformed_pos[:, 0]
-y_def = deformed_pos[:, 1]
-ax.scatter(x_def, y_def, c='red', s=1, alpha=0.5, label=f'Deformed (×{deformation_scale})')
-ax.set_xlabel('x (m)')
-ax.set_ylabel('y (m)')
-ax.set_title('True Deformed Shape', fontweight='bold')
-# ax.legend()
-ax.grid(True, alpha=0.3)
-ax.set_aspect('equal')
 
-# 2. Elastic fields
-ax = axes[1]
-scatter = ax.scatter(node_positions[:, 0], node_positions[:, 1],
-                    c=E_meas, cmap='jet', s=10, vmin=E_min, vmax=E_max)
-cbar = plt.colorbar(scatter, ax=ax)
-cbar.set_label('Young\'s Modulus (Pa)')
-ax.set_xlabel('x (m)')
-ax.set_ylabel('y (m)')
-ax.set_title('True Elastic Field', fontweight='bold')
-ax.set_aspect('equal')
-ax.grid(True, alpha=0.3)
+print(theoretical_strain)
+print(np.mean(measured_strain), np.median(measured_strain))
 
-ax = axes[2]
-scatter = ax.scatter(node_positions[:, 0], node_positions[:, 1],
-                    c=example.init_E, cmap='jet', s=10, vmin=E_min, vmax=E_max)
-cbar = plt.colorbar(scatter, ax=ax)
-cbar.set_label('Young\'s Modulus (Pa)')
-ax.set_xlabel('x (m)')
-ax.set_ylabel('y (m)')
-ax.set_title('Initial Elastic Field', fontweight='bold')
-ax.set_aspect('equal')
-ax.grid(True, alpha=0.3)
-
-ax = axes[3]
-scatter = ax.scatter(node_positions[:, 0], node_positions[:, 1],
-                    c=E_est, cmap='jet', s=10, vmin=E_min, vmax=E_max)
-cbar = plt.colorbar(scatter, ax=ax)
-cbar.set_label('Young\'s Modulus (Pa)')
-ax.set_xlabel('x (m)')
-ax.set_ylabel('y (m)')
-ax.set_title('Estimated Elastic Field', fontweight='bold')
-ax.set_aspect('equal')
-ax.grid(True, alpha=0.3)
-
-plt.savefig("adam_3d_nh_compare.png", dpi=300)
-plt.show()
-
-fig = plt.figure()
-ax = fig.add_subplot(projection='3d')
-scatter = ax.scatter(node_positions[:, 0], node_positions[:, 1], zs=node_positions[:, 2],
-                    c=E_meas, cmap='jet', s=10, vmin=E_min, vmax=E_max)
-cbar = plt.colorbar(scatter, ax=ax)
-cbar.set_label('Young\'s Modulus (Pa)')
-ax.set_xlabel('x (m)')
-ax.set_ylabel('y (m)')
-ax.set_ylabel('z (m)')
-ax.set_title('True Elastic Field', fontweight='bold')
+# # 1.
+# # Deformed positions
+# deformed_pos = node_positions + deformation_scale * disp_meas
+# ax = axes[0]
+# x = node_positions[:, 0]
+# y = node_positions[:, 1]
+# ax.scatter(x, y, c='blue', s=1, alpha=0.3, label='Original')
+# # Deformed shape
+# x_def = deformed_pos[:, 0]
+# y_def = deformed_pos[:, 1]
+# ax.scatter(x_def, y_def, c='red', s=1, alpha=0.5, label=f'Deformed (×{deformation_scale})')
+# ax.set_xlabel('x (m)')
+# ax.set_ylabel('y (m)')
+# ax.set_title('True Deformed Shape', fontweight='bold')
+# # ax.legend()
+# ax.grid(True, alpha=0.3)
 # ax.set_aspect('equal')
-ax.grid(True, alpha=0.3)
 
-
-plt.savefig("adam_3d_nh_meas.png", dpi=300)
-plt.show()
-
-fig = plt.figure()
-ax = fig.add_subplot(projection='3d')
-scatter = ax.scatter(node_positions[:, 0], node_positions[:, 1], zs=node_positions[:, 2],
-                    c=example.init_E, cmap='jet', s=10, vmin=E_min, vmax=E_max)
-cbar = plt.colorbar(scatter, ax=ax)
-cbar.set_label('Young\'s Modulus (Pa)')
-ax.set_xlabel('x (m)')
-ax.set_ylabel('y (m)')
-ax.set_ylabel('z (m)')
-ax.set_title('Initialized Elastic Field', fontweight='bold')
+# # 2. Elastic fields
+# ax = axes[1]
+# scatter = ax.scatter(node_positions[:, 0], node_positions[:, 1],
+#                     c=E_meas, cmap='jet', s=10, vmin=E_min, vmax=E_max)
+# cbar = plt.colorbar(scatter, ax=ax)
+# cbar.set_label('Young\'s Modulus (Pa)')
+# ax.set_xlabel('x (m)')
+# ax.set_ylabel('y (m)')
+# ax.set_title('True Elastic Field', fontweight='bold')
 # ax.set_aspect('equal')
-ax.grid(True, alpha=0.3)
+# ax.grid(True, alpha=0.3)
 
-
-plt.savefig("adam_3d_nh_init.png", dpi=300)
-plt.show()
-
-fig = plt.figure()
-ax = fig.add_subplot(projection='3d')
-scatter = ax.scatter(node_positions[:, 0], node_positions[:, 1], zs=node_positions[:, 2],
-                    c=E_est, cmap='jet', s=10, vmin=E_min, vmax=E_max)
-cbar = plt.colorbar(scatter, ax=ax)
-cbar.set_label('Young\'s Modulus (Pa)')
-ax.set_xlabel('x (m)')
-ax.set_ylabel('y (m)')
-ax.set_ylabel('z (m)')
-ax.set_title('Estimated Elastic Field', fontweight='bold')
+# ax = axes[2]
+# scatter = ax.scatter(node_positions[:, 0], node_positions[:, 1],
+#                     c=example.init_E, cmap='jet', s=10, vmin=E_min, vmax=E_max)
+# cbar = plt.colorbar(scatter, ax=ax)
+# cbar.set_label('Young\'s Modulus (Pa)')
+# ax.set_xlabel('x (m)')
+# ax.set_ylabel('y (m)')
+# ax.set_title('Initial Elastic Field', fontweight='bold')
 # ax.set_aspect('equal')
-ax.grid(True, alpha=0.3)
+# ax.grid(True, alpha=0.3)
+
+# ax = axes[3]
+# scatter = ax.scatter(node_positions[:, 0], node_positions[:, 1],
+#                     c=E_est, cmap='jet', s=10, vmin=E_min, vmax=E_max)
+# cbar = plt.colorbar(scatter, ax=ax)
+# cbar.set_label('Young\'s Modulus (Pa)')
+# ax.set_xlabel('x (m)')
+# ax.set_ylabel('y (m)')
+# ax.set_title('Estimated Elastic Field', fontweight='bold')
+# ax.set_aspect('equal')
+# ax.grid(True, alpha=0.3)
+
+# plt.savefig("figures/3d_ut_compare.png", dpi=300)
+# plt.show()
+
+# fig = plt.figure()
+# ax = fig.add_subplot(projection='3d')
+# scatter = ax.scatter(node_positions[:, 0], node_positions[:, 1], zs=node_positions[:, 2],
+#                     c=E_meas, cmap='jet', s=10, vmin=E_min, vmax=E_max)
+# cbar = plt.colorbar(scatter, ax=ax)
+# cbar.set_label('Young\'s Modulus (Pa)')
+# ax.set_xlabel('x (m)')
+# ax.set_ylabel('y (m)')
+# ax.set_ylabel('z (m)')
+# ax.set_title('True Elastic Field', fontweight='bold')
+# # ax.set_aspect('equal')
+# ax.grid(True, alpha=0.3)
 
 
-plt.savefig("adam_3d_nh_est.png", dpi=300)
-plt.show()
+# plt.savefig("figures/3d_ut_meas.png", dpi=300)
+# plt.show()
+
+# fig = plt.figure()
+# ax = fig.add_subplot(projection='3d')
+# scatter = ax.scatter(node_positions[:, 0], node_positions[:, 1], zs=node_positions[:, 2],
+#                     c=example.init_E, cmap='jet', s=10, vmin=E_min, vmax=E_max)
+# cbar = plt.colorbar(scatter, ax=ax)
+# cbar.set_label('Young\'s Modulus (Pa)')
+# ax.set_xlabel('x (m)')
+# ax.set_ylabel('y (m)')
+# ax.set_ylabel('z (m)')
+# ax.set_title('Initialized Elastic Field', fontweight='bold')
+# # ax.set_aspect('equal')
+# ax.grid(True, alpha=0.3)
+
+
+# plt.savefig("figures/3d_ut_init.png", dpi=300)
+# plt.show()
+
+# fig = plt.figure()
+# ax = fig.add_subplot(projection='3d')
+# scatter = ax.scatter(node_positions[:, 0], node_positions[:, 1], zs=node_positions[:, 2],
+#                     c=E_est, cmap='jet', s=10, vmin=E_min, vmax=E_max)
+# cbar = plt.colorbar(scatter, ax=ax)
+# cbar.set_label('Young\'s Modulus (Pa)')
+# ax.set_xlabel('x (m)')
+# ax.set_ylabel('y (m)')
+# ax.set_ylabel('z (m)')
+# ax.set_title('Estimated Elastic Field', fontweight='bold')
+# # ax.set_aspect('equal')
+# ax.grid(True, alpha=0.3)
+
+
+# plt.savefig("figures/3d_ut_est.png", dpi=300)
+# plt.show()
