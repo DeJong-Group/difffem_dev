@@ -16,7 +16,7 @@ max_concurrent_processes = 1
 
 
 def run_until_done(semaphore, dummy):
-    result_filename = f"results/3d_damage_20k.json"
+    result_filename = f"results/3d_damage_ltd.json"
     
     with semaphore:
         while not os.path.exists(result_filename):

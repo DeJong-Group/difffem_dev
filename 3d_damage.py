@@ -30,7 +30,9 @@ def classify_boundary_sides(
     domain: fem.Domain,
     left: wp.array(dtype=int),
     right: wp.array(dtype=int),
+    face_ab: wp.array(dtype=wp.float32),
     x_bound: wp.float32,
+    y_bound: wp.float32,
 ):
     nor = fem.normal(domain, s)
     pos = fem.position(domain, s)
@@ -44,6 +46,9 @@ def classify_boundary_sides(
         left[s.qp_index] = 1
     elif pos[0] == x_bound:
         right[s.qp_index] = 1
+    elif pos[1] == 0.0 or pos[1] == y_bound:
+        face_ab[s.qp_index] = 1.0
+    # face_ab[s.qp_index] = 1.0
 
 @wp.func
 def hooke_stress(
@@ -84,14 +89,13 @@ def loss_disp(
 
 @fem.integrand
 def loss_form(
-    s: fem.Sample, domain: fem.Domain, u: fem.Field, u_meas: fem.Field
+    s: fem.Sample, domain: fem.Domain, u: fem.Field, u_meas: fem.Field, mask: wp.array(dtype=wp.float32)
 ):
     strain = strain_field(s, u)
     strain_meas = strain_field(s, u_meas)
-    diff = strain - strain_meas
+    diff = (strain - strain_meas)
     stress_norm_sq = 0.5 * wp.ddot(diff, diff) * 1e20
-
-    return stress_norm_sq 
+    return stress_norm_sq * mask[s.qp_index]
 
 
 
@@ -171,15 +175,22 @@ class Example:
 
         left_mask = wp.zeros(shape=boundary.element_count(), dtype=int)
         right_mask = wp.zeros(shape=boundary.element_count(), dtype=int)
+        self.ab_mask = wp.zeros(shape=boundary.element_count(), dtype=float)
 
         fem.interpolate(
             classify_boundary_sides,
             quadrature=fem.RegularQuadrature(boundary, order=0),
-            values={"left": left_mask, "right": right_mask, "x_bound": bounds_hi[0]},
+            values={"left": left_mask, 
+                    "right": right_mask, 
+                    "face_ab": self.ab_mask,
+                    "x_bound": bounds_hi[0],
+                    "y_bound": bounds_hi[1]
+                    },
         )
 
         self._left = fem.Subdomain(boundary, element_mask=left_mask)
         self._right = fem.Subdomain(boundary, element_mask=right_mask)
+        # self._face = fem.Subdomain(boundary, element_mask=self.ab_mask)
         # Build projectors for the left-side homogeneous Dirichlet condition
         u_left_bd_test = fem.make_test(space=self._u_space, domain=self._left)
         u_left_bd_trial = fem.make_trial(space=self._u_space, domain=self._left)
@@ -321,6 +332,7 @@ class Example:
                 loss_form,
                 # loss_disp,
                 fields={"u": self._u_field, "u_meas": self._u_field_meas},
+                values={"mask": self.ab_mask},
                 domain=self._u_test.domain,
                 output=loss,
             )
@@ -332,7 +344,7 @@ class Example:
         self.optimizer.step([-self.params.grad])
         grad = -self.E_array.grad.numpy()
         self.tape.zero()
-        
+        # print(loss.numpy().tolist(), grad)
 
         self.strain_field = self.strain_space_meas.make_field()
         fem.interpolate(
@@ -348,7 +360,7 @@ with wp.ScopedDevice(None):
     example = Example(
         quiet=True,
         degree=1,
-        resolution=(100, 6, 6),
+        resolution=(50, 3, 3),
         mesh="quad",
         poisson_ratio=0.3,
         load=wp.vec3(2.0e3*10.0, 0.0, 0.0),
@@ -364,13 +376,6 @@ with wp.ScopedDevice(None):
         losses.append(loss)
         params.append(param)
 
-result_dict = {
-        "E_hist" : params,
-        "losses" : losses,
-    }
-
-with open(f"results/3d_damage_20k.json", "w") as outfile: 
-    json.dump(result_dict, outfile)
 
 import matplotlib.pyplot as plt
 fig, axes = plt.subplots(2, 1, figsize=(16, 10))
@@ -390,8 +395,15 @@ ax.hlines(25e9, 0, n_its, color='r', alpha=0.4)
 ax.set_xlabel('Iterations')
 ax.set_ylabel('E')
 ax.set_title('Adam Learning Curve')
+result_dict = {
+        "E_hist" : params,
+        "losses" : losses,
+    }
+exp_name = "3d_damage_ltd"
+with open(f"results/{exp_name}.json", "w") as outfile: 
+    json.dump(result_dict, outfile)
 
-plt.savefig("figures/3d_damage.png", dpi=300)
+plt.savefig(f"figures/{exp_name}.png", dpi=300)
 plt.show()
 
 fig, axes = plt.subplots(4, 1, figsize=(16, 12))
@@ -470,7 +482,7 @@ ax.set_title('Estimated Elastic Field', fontweight='bold')
 ax.set_aspect('equal')
 ax.grid(True, alpha=0.3)
 
-plt.savefig("figures/3d_damage_compare.png", dpi=300)
+plt.savefig(f"figures/{exp_name}_compare.png", dpi=300)
 plt.show()
 
 fig = plt.figure()
@@ -487,7 +499,7 @@ ax.set_title('True Elastic Field', fontweight='bold')
 ax.grid(True, alpha=0.3)
 ax.set_box_aspect([ub - lb for lb, ub in (getattr(ax, f'get_{a}lim')() for a in 'xyz')])
 
-plt.savefig("figures/3d_damage_meas.png", dpi=300)
+plt.savefig(f"figures/{exp_name}_meas.png", dpi=300)
 plt.show()
 
 fig = plt.figure()
@@ -504,7 +516,7 @@ ax.set_title('Initialized Elastic Field', fontweight='bold')
 ax.grid(True, alpha=0.3)
 ax.set_box_aspect([ub - lb for lb, ub in (getattr(ax, f'get_{a}lim')() for a in 'xyz')])
 
-plt.savefig("figures/3d_damage_init.png", dpi=300)
+plt.savefig(f"figures/{exp_name}_init.png", dpi=300)
 plt.show()
 
 fig = plt.figure()
@@ -521,5 +533,5 @@ ax.set_title('Estimated Elastic Field', fontweight='bold')
 ax.grid(True, alpha=0.3)
 ax.set_box_aspect([ub - lb for lb, ub in (getattr(ax, f'get_{a}lim')() for a in 'xyz')])
 
-plt.savefig("figures/3d_damage_est.png", dpi=300)
+plt.savefig(f"figures/{exp_name}_est.png", dpi=300)
 plt.show()
