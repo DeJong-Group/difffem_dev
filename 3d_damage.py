@@ -30,9 +30,10 @@ def classify_boundary_sides(
     domain: fem.Domain,
     left: wp.array(dtype=int),
     right: wp.array(dtype=int),
-    face_ab: wp.array(dtype=wp.float32),
+    # face_ab: wp.array(dtype=wp.float32),
+    face_ab: wp.array(dtype=int),
     x_bound: wp.float32,
-    y_bound: wp.float32,
+    z_bound: wp.float32,
 ):
     nor = fem.normal(domain, s)
     pos = fem.position(domain, s)
@@ -46,8 +47,8 @@ def classify_boundary_sides(
         left[s.qp_index] = 1
     elif pos[0] == x_bound:
         right[s.qp_index] = 1
-    elif pos[1] == 0.0 or pos[1] == y_bound:
-        face_ab[s.qp_index] = 1.0
+    elif pos[2] == 0.0 or pos[2] == z_bound:
+        face_ab[s.qp_index] = 1#.0
     # face_ab[s.qp_index] = 1.0
 
 @wp.func
@@ -64,7 +65,13 @@ def strain_field(s: fem.Sample, u: fem.Field):
     return fem.D(u, s)
 
 @fem.integrand
-def hooke_elasticity_form(s: fem.Sample, u: fem.Field, v: fem.Field, E_field: fem.Field, nu: float):
+def hooke_elasticity_form(
+    s: fem.Sample, 
+    u: fem.Field, 
+    v: fem.Field, 
+    E_field: fem.Field, 
+    nu: float
+):
     E_val = E_field(s)
     l = lame_from_E_nu(E_val, nu)
     lamb = l[0]
@@ -73,12 +80,20 @@ def hooke_elasticity_form(s: fem.Sample, u: fem.Field, v: fem.Field, E_field: fe
     return wp.ddot(fem.D(v, s), stress)
 
 @fem.integrand
-def applied_load_form(s: fem.Sample, domain: fem.Domain, v: fem.Field, load: wp.array(dtype=wp.float32)):
+def applied_load_form(
+    s: fem.Sample, 
+    domain: fem.Domain, 
+    v: fem.Field, 
+    load: wp.array(dtype=wp.float32)
+):
     return v(s)[0]*load[0] + v(s)[1]*load[1] + v(s)[2]*load[2]
 
 @fem.integrand
 def loss_disp(
-    s: fem.Sample, domain: fem.Domain, u: fem.Field, u_meas: fem.Field
+    s: fem.Sample, 
+    domain: fem.Domain, 
+    u: fem.Field, 
+    u_meas: fem.Field
 ):
     disp = u(s)
     disp_meas = u_meas(s)
@@ -89,13 +104,19 @@ def loss_disp(
 
 @fem.integrand
 def loss_form(
-    s: fem.Sample, domain: fem.Domain, u: fem.Field, u_meas: fem.Field, mask: wp.array(dtype=wp.float32)
+    s: fem.Sample, 
+    domain: fem.Domain, 
+    u: fem.Field,
+    u_meas: fem.Field, 
+    mask: wp.array(dtype=int),
 ):
     strain = strain_field(s, u)
     strain_meas = strain_field(s, u_meas)
     diff = (strain - strain_meas)
-    stress_norm_sq = 0.5 * wp.ddot(diff, diff) * 1e20
-    return stress_norm_sq * mask[s.qp_index]
+    axial = 0.5 * ((diff[0,0] ** 2.0) + (diff[1,1] ** 2.0))
+    # stress_norm_sq = 0.5 * wp.ddot(diff, diff) * 1e20
+    stress_norm_sq = axial * 1e20
+    return stress_norm_sq #* mask[s.qp_index]
 
 
 
@@ -175,7 +196,8 @@ class Example:
 
         left_mask = wp.zeros(shape=boundary.element_count(), dtype=int)
         right_mask = wp.zeros(shape=boundary.element_count(), dtype=int)
-        self.ab_mask = wp.zeros(shape=boundary.element_count(), dtype=float)
+        # self.ab_mask = wp.zeros(shape=boundary.element_count(), dtype=float)
+        self.ab_mask = wp.zeros(shape=boundary.element_count(), dtype=int)
 
         fem.interpolate(
             classify_boundary_sides,
@@ -184,13 +206,12 @@ class Example:
                     "right": right_mask, 
                     "face_ab": self.ab_mask,
                     "x_bound": bounds_hi[0],
-                    "y_bound": bounds_hi[1]
+                    "z_bound": bounds_hi[2]
                     },
         )
-
         self._left = fem.Subdomain(boundary, element_mask=left_mask)
         self._right = fem.Subdomain(boundary, element_mask=right_mask)
-        # self._face = fem.Subdomain(boundary, element_mask=self.ab_mask)
+        self._face = fem.Subdomain(boundary, element_mask=self.ab_mask)
         # Build projectors for the left-side homogeneous Dirichlet condition
         u_left_bd_test = fem.make_test(space=self._u_space, domain=self._left)
         u_left_bd_trial = fem.make_trial(space=self._u_space, domain=self._left)
@@ -226,6 +247,8 @@ class Example:
         E_meas_init = np.zeros((E_space_meas.node_count()))*1.0e7+25.0e9
         damage_idx_start = int(E_space_meas.node_count()*0.5) - ((resolution[1]+1)*(resolution[2]+1))//2
         damage_idx_width = int((resolution[1]+1)*(resolution[2]+1))
+        # damage_idx_start = int(E_space_meas.node_count()*0.5)# - ((resolution[1]+1)*(resolution[2]+1))//2
+        # damage_idx_width = int((resolution[1]+1)*(resolution[2]+1))
         damage_idx = np.arange(damage_idx_start, damage_idx_start+damage_idx_width)
         E_meas_init[damage_idx] = 25.0e9*0.9
         
@@ -331,9 +354,9 @@ class Example:
             fem.integrate(
                 loss_form,
                 # loss_disp,
-                fields={"u": self._u_field, "u_meas": self._u_field_meas},
+                fields={"u": self._u_field.trace(), "u_meas": self._u_field_meas.trace()},
                 values={"mask": self.ab_mask},
-                domain=self._u_test.domain,
+                domain=self._face,
                 output=loss,
             )
 
@@ -345,6 +368,7 @@ class Example:
         grad = -self.E_array.grad.numpy()
         self.tape.zero()
         # print(loss.numpy().tolist(), grad)
+        # print(self.params.numpy().min(), self.params.numpy().max())
 
         self.strain_field = self.strain_space_meas.make_field()
         fem.interpolate(
@@ -360,7 +384,7 @@ with wp.ScopedDevice(None):
     example = Example(
         quiet=True,
         degree=1,
-        resolution=(50, 3, 3),
+        resolution=(100, 6, 6),
         mesh="quad",
         poisson_ratio=0.3,
         load=wp.vec3(2.0e3*10.0, 0.0, 0.0),
@@ -369,7 +393,7 @@ with wp.ScopedDevice(None):
 
     losses = []
     params = []
-    n_its = 20000
+    n_its = 200
     from tqdm import tqdm
     for _ in tqdm(np.arange(n_its)):
         loss, param = example.step()
@@ -399,7 +423,7 @@ result_dict = {
         "E_hist" : params,
         "losses" : losses,
     }
-exp_name = "3d_damage_ltd"
+exp_name = "3d_damage_ltd_100x6x6"
 with open(f"results/{exp_name}.json", "w") as outfile: 
     json.dump(result_dict, outfile)
 
