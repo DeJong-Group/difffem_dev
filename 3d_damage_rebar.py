@@ -42,15 +42,16 @@ def classify_boundary_sides(
     #     left[s.qp_index] = 1
     # elif nor[0] > 0.5:
     #     right[s.qp_index] = 1
-    
-    if pos[0] == 0.0:
-        left[s.qp_index] = 1
-    elif pos[0] == x_bound:
-        right[s.qp_index] = 1
-    elif pos[2] == 0.0 or pos[2] == z_bound:
-        face_ab[s.qp_index] = 1#.0
-    # face_ab[s.qp_index] = 1.0
-
+    if (pos[1]>=0.0487 and pos[1]<=0.0713) and (pos[2]>=0.0487 and pos[2]<=0.0713):
+        if pos[0] == 0.0:
+            left[s.qp_index] = 1
+        elif pos[0] == x_bound:
+            right[s.qp_index] = 1
+    # elif pos[2] == 0.0 or pos[2] == z_bound:
+    #     face_ab[s.qp_index] = 1
+    if ((pos[2]>0.025 and pos[2]<0.0487) or (pos[2]>0.0713 and pos[2]<0.095)) and (pos[1]>0.0487 and pos[1]<0.0713):
+        face_ab[s.qp_index] = 1
+    # face_ab[s.qp_index] = 1
 @wp.func
 def hooke_stress(
     strain: wp.mat33, 
@@ -113,7 +114,7 @@ def loss_form(
     strain = strain_field(s, u)
     strain_meas = strain_field(s, u_meas)
     diff = (strain - strain_meas)
-    axial = 0.5 * ((diff[0,0] ** 2.0) + (diff[1,1] ** 2.0))
+    axial = 0.5 * (diff[0,0] ** 2.0)# + (diff[1,1] ** 2.0))
     # stress_norm_sq = 0.5 * wp.ddot(diff, diff) * 1e20
     stress_norm_sq = axial * 1e20
     return stress_norm_sq #* mask[s.qp_index]
@@ -150,8 +151,8 @@ class Example:
         node_x = np.linspace(bounds_lo[0], bounds_hi[0], self.resolution[0]+1)
         # node_y = np.linspace(bounds_lo[1], bounds_hi[1], self.resolution[1])
         # node_z = np.linspace(bounds_lo[2], bounds_hi[2], self.resolution[2])
-        node_y = np.array([bounds_lo[1], 0.02, 0.0473, 0.06, 0.0727, 0.1, bounds_hi[1]])
-        node_z = np.array([bounds_lo[2], 0.02, 0.0473, 0.06, 0.0727, 0.1, bounds_hi[2]])
+        node_y = np.array([bounds_lo[1], 0.025, 0.0487, 0.0713, 0.095, bounds_hi[1]])
+        node_z = np.array([bounds_lo[2], 0.025, 0.0487, 0.0713, 0.095, bounds_hi[2]])
 
         self.Nx = self.resolution[0]
         self.Ny = len(node_y) - 1
@@ -160,6 +161,12 @@ class Example:
         positions_np = np.transpose(np.meshgrid(node_x, node_y, node_z, indexing="ij"), axes=(1, 2, 3, 0)).reshape(-1, 3)
         positions = wp.array(positions_np, dtype=wp.vec3)
         
+        target_vals = np.array([0.0487, 0.0713])
+        tol = 1e-6
+        y_mask = np.isclose(positions_np[:, 1][:, None], target_vals, atol=tol).any(axis=1)
+        z_mask = np.isclose(positions_np[:, 2][:, None], target_vals, atol=tol).any(axis=1)
+
+        rebar_indices = np.where(y_mask & z_mask)[0]
 
         if mesh == "tri":
             # triangle mesh, optimize vertices directly
@@ -263,14 +270,16 @@ class Example:
 
         E_space_meas = fem.make_polynomial_space(self._geo, degree=degree, dtype=float)
         self._E_field_meas = fem.make_discrete_field(space=E_space_meas)
-
         E_meas_init = np.zeros((E_space_meas.node_count()))*1.0e7+25.0e9
+        
+
         damage_idx_start = int(E_space_meas.node_count()*0.5) - ((self.Ny+1)*(self.Nz+1))//2
-        damage_idx_width = int((resolution[1]+1)*(resolution[2]+1))
+        damage_idx_width = int((self.Ny+1)*(self.Nz+1))
         # damage_idx_start = int(E_space_meas.node_count()*0.5)# - ((resolution[1]+1)*(resolution[2]+1))//2
         # damage_idx_width = int((resolution[1]+1)*(resolution[2]+1))
         damage_idx = np.arange(damage_idx_start, damage_idx_start+damage_idx_width)
         E_meas_init[damage_idx] = 25.0e9*0.9
+        E_meas_init[rebar_indices] = 200.0e9
         
         self._E_field_meas.dof_values = wp.array(E_meas_init, dtype=float, requires_grad=True)
         
@@ -310,6 +319,7 @@ class Example:
         # Current implementation assumes scalar arrays, so cast our vec2 arrays to scalars
         N = self.E_space.node_count()
         self.init_E = np.zeros(N)+25.0e9
+        self.init_E[rebar_indices] = 200.0e9
         self.E_array = wp.array(self.init_E, dtype=float, requires_grad=True)
         self.params = wp.array(self.E_array, dtype=wp.float32).flatten()
         self.params.grad = wp.array(self.E_array.grad, dtype=wp.float32).flatten()
@@ -388,7 +398,7 @@ class Example:
         grad = -self.E_array.grad.numpy()
         self.tape.zero()
         print(loss.numpy().tolist(), grad)
-        # print(self.params.numpy().min(), self.params.numpy().max())
+        print(self.params.numpy().min(), self.params.numpy().max())
 
         self.strain_field = self.strain_space_meas.make_field()
         fem.interpolate(
@@ -407,13 +417,14 @@ with wp.ScopedDevice(None):
         resolution=(100, 6, 6),
         mesh="quad",
         poisson_ratio=0.3,
-        load=wp.vec3(2.0e3*10.0, 0.0, 0.0),
+        load=wp.vec3(200.0e3/0.000509, 0.0, 0.0),
         lr=5.0e8,
+        # lr=5.0e6,
     )
 
     losses = []
     params = []
-    n_its = 20
+    n_its = 500
     from tqdm import tqdm
     for _ in tqdm(np.arange(n_its)):
         loss, param = example.step()
@@ -443,7 +454,7 @@ result_dict = {
         "E_hist" : params,
         "losses" : losses,
     }
-exp_name = "3d_rebar"
+exp_name = "3d_rebar_cable"
 with open(f"results/{exp_name}.json", "w") as outfile: 
     json.dump(result_dict, outfile)
 
@@ -469,15 +480,21 @@ strain_max = np.max((np.max(strain_meas[:,0,0]), np.max(strain_est[:,0,0])))
 E_min = np.min((np.min(E_meas), np.min(E_est), np.min(example.init_E)))
 E_max = np.max((np.max(E_meas), np.max(E_est), np.max(example.init_E)))
 
+best_index = np.argmin(losses)
+E_best = params[best_index]
+
+vmin = 23.0e9
+vmax = 27.0e9
+
 fig, axes = plt.subplots(5, 1, figsize=(16, 12))
 
-deformation_scale=10000
+deformation_scale=100
 
 # cross section
 ax = axes[0]
 y = node_positions[:, 1]
 z = node_positions[:, 2]
-ax.scatter(y, z, c='blue', s=1, alpha=0.3, label='Original')
+ax.scatter(y, z, c=E_meas, s=1, alpha=0.3, label='Original')
 ax.set_xlabel('y (m)')
 ax.set_ylabel('z (m)')
 ax.set_title('Beam Cross Section', fontweight='bold')
@@ -506,7 +523,7 @@ ax.set_aspect('equal')
 # 2. Elastic fields
 ax = axes[2]
 scatter = ax.scatter(node_positions[:, 0], node_positions[:, 1],
-                    c=E_meas, cmap='jet', s=10, vmin=E_min, vmax=E_max)
+                    c=E_meas, cmap='jet', s=10, vmin=vmin, vmax=vmax)
 cbar = plt.colorbar(scatter, ax=ax)
 cbar.set_label('Young\'s Modulus (Pa)')
 ax.set_xlabel('x (m)')
@@ -517,7 +534,7 @@ ax.grid(True, alpha=0.3)
 
 ax = axes[3]
 scatter = ax.scatter(node_positions[:, 0], node_positions[:, 1],
-                    c=example.init_E, cmap='jet', s=10, vmin=E_min, vmax=E_max)
+                    c=example.init_E, cmap='jet', s=10, vmin=vmin, vmax=vmax)
 cbar = plt.colorbar(scatter, ax=ax)
 cbar.set_label('Young\'s Modulus (Pa)')
 ax.set_xlabel('x (m)')
@@ -528,7 +545,7 @@ ax.grid(True, alpha=0.3)
 
 ax = axes[4]
 scatter = ax.scatter(node_positions[:, 0], node_positions[:, 1],
-                    c=E_est, cmap='jet', s=10, vmin=E_min, vmax=E_max)
+                    c=E_est, cmap='jet', s=10, vmin=vmin, vmax=vmax)
 cbar = plt.colorbar(scatter, ax=ax)
 cbar.set_label('Young\'s Modulus (Pa)')
 ax.set_xlabel('x (m)')
@@ -543,7 +560,7 @@ plt.show()
 fig = plt.figure()
 ax = fig.add_subplot(projection='3d')
 scatter = ax.scatter(node_positions[:, 0], node_positions[:, 1], zs=node_positions[:, 2],
-                    c=E_meas, cmap='jet', s=10, vmin=E_min, vmax=E_max)
+                    c=E_meas, cmap='jet', s=10, vmin=vmin, vmax=vmax)
 cbar = plt.colorbar(scatter, ax=ax)
 cbar.set_label('Young\'s Modulus (Pa)')
 ax.set_xlabel('x (m)')
@@ -560,7 +577,7 @@ plt.show()
 fig = plt.figure()
 ax = fig.add_subplot(projection='3d')
 scatter = ax.scatter(node_positions[:, 0], node_positions[:, 1], zs=node_positions[:, 2],
-                    c=example.init_E, cmap='jet', s=10, vmin=E_min, vmax=E_max)
+                    c=example.init_E, cmap='jet', s=10, vmin=vmin, vmax=vmax)
 cbar = plt.colorbar(scatter, ax=ax)
 cbar.set_label('Young\'s Modulus (Pa)')
 ax.set_xlabel('x (m)')
@@ -577,7 +594,7 @@ plt.show()
 fig = plt.figure()
 ax = fig.add_subplot(projection='3d')
 scatter = ax.scatter(node_positions[:, 0], node_positions[:, 1], zs=node_positions[:, 2],
-                    c=E_est, cmap='jet', s=10, vmin=E_min, vmax=E_max)
+                    c=E_est, cmap='jet', s=10, vmin=vmin, vmax=vmax)
 cbar = plt.colorbar(scatter, ax=ax)
 cbar.set_label('Young\'s Modulus (Pa)')
 ax.set_xlabel('x (m)')
@@ -589,4 +606,21 @@ ax.grid(True, alpha=0.3)
 ax.set_box_aspect([ub - lb for lb, ub in (getattr(ax, f'get_{a}lim')() for a in 'xyz')])
 
 plt.savefig(f"figures/{exp_name}_est.png", dpi=300)
+plt.show()
+
+fig = plt.figure()
+ax = fig.add_subplot(projection='3d')
+scatter = ax.scatter(node_positions[:, 0], node_positions[:, 1], zs=node_positions[:, 2],
+                    c=E_best, cmap='jet', s=10, vmin=vmin, vmax=vmax)
+cbar = plt.colorbar(scatter, ax=ax)
+cbar.set_label('Young\'s Modulus (Pa)')
+ax.set_xlabel('x (m)')
+ax.set_ylabel('y (m)')
+ax.set_ylabel('z (m)')
+ax.set_title('Best Estimated Elastic Field', fontweight='bold')
+# ax.set_aspect('equal')
+ax.grid(True, alpha=0.3)
+ax.set_box_aspect([ub - lb for lb, ub in (getattr(ax, f'get_{a}lim')() for a in 'xyz')])
+
+plt.savefig(f"figures/{exp_name}_best.png", dpi=300)
 plt.show()

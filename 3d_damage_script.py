@@ -10,13 +10,13 @@ import numpy as np
 
 # The target script name
 # target_script = "cs_true.py"
-target_script_damaged = "3d_damage.py"
+target_script_damaged = "3d_damage_rebar.py"
 
 max_concurrent_processes = 1
 
 
 def run_until_done(semaphore, dummy):
-    result_filename = f"results/3d_damage_ltd_25x6x6.json"
+    result_filename = f"results/3d_damage_rebar.json"
     
     with semaphore:
         while not os.path.exists(result_filename):
