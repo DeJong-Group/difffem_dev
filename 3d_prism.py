@@ -8,6 +8,39 @@ from warp.optim import Adam
 import json
 
 @wp.kernel
+def map_slices_to_cells2(
+    params: wp.array(dtype=float),
+    concrete_indices: wp.array(dtype=int),
+    rebar_indices: wp.array(dtype=int),
+    cell_slice_map_concrete: wp.array(dtype=int),
+    cell_slice_map_rebar: wp.array(dtype=int),
+    full_E_field: wp.array(dtype=float),
+    n_slices: int,
+    n_concrete: int,
+    n_rebar: int,
+    freeze_rebar: bool,
+    rebar_static_val: float
+):
+    tid = wp.tid()
+    
+    # Map Concrete Slices
+    if tid < n_concrete:
+        c_idx = concrete_indices[tid]
+        s_idx = cell_slice_map_concrete[tid]
+        # Concrete parameters are in the first track: [0 : n_slices]
+        full_E_field[c_idx] = params[s_idx]
+        
+    # Map Rebar Slices
+    if tid < n_rebar:
+        r_idx = rebar_indices[tid]
+        if freeze_rebar:
+            full_E_field[r_idx] = rebar_static_val
+        else:
+            s_idx = cell_slice_map_rebar[tid]
+            # Rebar parameters are in the second track: [n_slices : 2*n_slices]
+            full_E_field[r_idx] = params[n_slices + s_idx]
+
+@wp.kernel
 def map_slices_to_cells(
     slice_values: wp.array(dtype=float),
     cell_slice_map: wp.array(dtype=int),
@@ -367,27 +400,58 @@ class Example:
             self.num_slices = self.Nx 
             all_cells = np.arange(self._geo.cell_count())
             self.concrete_indices = np.delete(all_cells, self.rebar_indices)
+            self.cell_slice_map_concrete = wp.array((self.concrete_indices // (self.Ny * self.Nz)).astype(int), dtype=int)
+            self.cell_slice_map_rebar = wp.array((self.rebar_indices // (self.Ny * self.Nz)).astype(int), dtype=int)
             self.n_concrete = len(self.concrete_indices)
-            self.cell_slice_map = (self.concrete_indices // (self.Ny * self.Nz)).astype(int)
-            self.slice_E_init = np.full(self.num_slices, 25.0e9, dtype=np.float32)
-            self.params = wp.array(self.slice_E_init, dtype=wp.float32, requires_grad=True)
+            self.n_rebar = len(self.rebar_indices)
+            # self.cell_slice_map = (self.concrete_indices // (self.Ny * self.Nz)).astype(int)
+            # self.slice_E_init = np.full(self.num_slices, 25.0e9, dtype=np.float32)
+            # self.params = wp.array(self.slice_E_init, dtype=wp.float32, requires_grad=True)
+            if self.freeze_rebar:
+                # Only Concrete Slices
+                init_params = np.full(self.num_slices, 25.0e9, dtype=np.float32)
+            else:
+                # Concatenate Concrete slices and Rebar slices
+                c_slices = np.full(self.num_slices, 25.0e9, dtype=np.float32)
+                r_slices = np.full(self.num_slices, 200.0e9, dtype=np.float32)
+                init_params = np.concatenate([c_slices, r_slices])
+            
+            self.params = wp.array(init_params, dtype=wp.float32, requires_grad=True)
         self.optimizer = Adam([self.params], lr=self.lr)
 
     def step(self):
         self.tape = wp.Tape()
         if self.opt_slice:
+            # with self.tape:
+            #     wp.launch(
+            #         kernel=map_slices_to_cells,
+            #         dim=self._geo.cell_count(),
+            #         inputs=[
+            #             self.params, 
+            #             wp.array(self.cell_slice_map, dtype=int),
+            #             wp.array(self.concrete_indices, dtype=int),
+            #             self.n_concrete,
+            #             self.E_array,
+            #             200.0e9,
+            #             wp.array(self.rebar_indices, dtype=int)
+            #         ]
+            #     )
             with self.tape:
                 wp.launch(
-                    kernel=map_slices_to_cells,
-                    dim=self._geo.cell_count(),
+                    kernel=map_slices_to_cells2,
+                    dim=max(self.n_concrete, self.n_rebar), # Launch for the larger set
                     inputs=[
                         self.params, 
-                        wp.array(self.cell_slice_map, dtype=int),
                         wp.array(self.concrete_indices, dtype=int),
-                        self.n_concrete,
+                        wp.array(self.rebar_indices, dtype=int),
+                        self.cell_slice_map_concrete,
+                        self.cell_slice_map_rebar,
                         self.E_array,
-                        200.0e9,
-                        wp.array(self.rebar_indices, dtype=int)
+                        self.Nx,        # n_slices
+                        self.n_concrete,
+                        self.n_rebar,
+                        self.freeze_rebar,
+                        200.0e9         # rebar_static_val
                     ]
                 )
 
@@ -497,7 +561,7 @@ class Example:
 # speciman = args.obs
 # loadstep = args.snapshot
 
-freeze_rebar = True
+freeze_rebar = False
 opt_slice = True
 specimen = "1"
 loadstep = "1"
@@ -531,7 +595,7 @@ with wp.ScopedDevice("cuda:0"):
 
     losses = []
     params = []
-    n_its = 200
+    n_its = 2000
     from tqdm import tqdm
     for _ in tqdm(np.arange(n_its)):
         loss, param = example.step()
