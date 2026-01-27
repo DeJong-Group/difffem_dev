@@ -16,7 +16,8 @@ def map_slices_to_cells(
     n_concrete: int,
     full_E_field: wp.array(dtype=float),
     rebar_E: float,
-    rebar_indices: wp.array(dtype=int)
+    rebar_indices: wp.array(dtype=int),
+    freeze_rebar: bool,
 ):
     tid = wp.tid()
     # Map concrete

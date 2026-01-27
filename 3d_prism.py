@@ -7,6 +7,24 @@ from warp.optim import Adam
 
 import json
 
+@wp.kernel
+def map_slices_to_cells(
+    slice_values: wp.array(dtype=float),
+    cell_slice_map: wp.array(dtype=int),
+    concrete_indices: wp.array(dtype=int),
+    n_concrete: int,
+    full_E_field: wp.array(dtype=float),
+    rebar_E: float,
+    rebar_indices: wp.array(dtype=int)
+):
+    tid = wp.tid()
+    # Map concrete
+    if tid < n_concrete:
+        c_idx = concrete_indices[tid]
+        s_idx = cell_slice_map[tid]
+        full_E_field[c_idx] = slice_values[s_idx]
+    
+
 @wp.func
 def lame_from_E_nu(E: float, nu: float) -> wp.vec2:
     # λ = Eν / ((1+ν)(1−2ν)),  μ = E / (2(1+ν))
@@ -138,6 +156,8 @@ class Example:
         strain_meas = None,
         strain_meas_x = None,
         u_meas = None,
+        freeze_rebar = False,
+        opt_slice = False
     ):
         self._quiet = quiet
         self.degree = degree
@@ -147,7 +167,9 @@ class Example:
         bounds_hi = wp.vec3(1.0, 0.12, 0.12)
         self._initial_volume = (bounds_hi - bounds_lo)[0] * (bounds_hi - bounds_lo)[1] * (bounds_hi - bounds_lo)[2]
         
-        
+        # optimization settings
+        self.freeze_rebar = freeze_rebar
+        self.opt_slice = opt_slice
 
         self.u_meas = u_meas
 
@@ -337,12 +359,37 @@ class Example:
         self.init_E = np.zeros(N)+25.0e9
         self.init_E[self.rebar_indices] = 200.0e9
         self.E_array = wp.array(self.init_E, dtype=float, requires_grad=True)
-        self.params = wp.array(self.E_array, dtype=wp.float32).flatten()
-        self.params.grad = wp.array(self.E_array.grad, dtype=wp.float32).flatten()
+        self.E_hist = []
+        if not self.opt_slice:
+            self.params = wp.array(self.E_array, dtype=wp.float32).flatten()
+            self.params.grad = wp.array(self.E_array.grad, dtype=wp.float32).flatten()
+        else:
+            self.num_slices = self.Nx 
+            all_cells = np.arange(self._geo.cell_count())
+            self.concrete_indices = np.delete(all_cells, self.rebar_indices)
+            self.n_concrete = len(self.concrete_indices)
+            self.cell_slice_map = (self.concrete_indices // (self.Ny * self.Nz)).astype(int)
+            self.slice_E_init = np.full(self.num_slices, 25.0e9, dtype=np.float32)
+            self.params = wp.array(self.slice_E_init, dtype=wp.float32, requires_grad=True)
         self.optimizer = Adam([self.params], lr=self.lr)
 
     def step(self):
         self.tape = wp.Tape()
+        if self.opt_slice:
+            with self.tape:
+                wp.launch(
+                    kernel=map_slices_to_cells,
+                    dim=self._geo.cell_count(),
+                    inputs=[
+                        self.params, 
+                        wp.array(self.cell_slice_map, dtype=int),
+                        wp.array(self.concrete_indices, dtype=int),
+                        self.n_concrete,
+                        self.E_array,
+                        200.0e9,
+                        wp.array(self.rebar_indices, dtype=int)
+                    ]
+                )
 
         self._E_field = fem.make_discrete_field(space=self.E_space)
         self._E_field.dof_values = self.E_array
@@ -415,12 +462,16 @@ class Example:
         self.tape.backward(loss=loss)
 
         # update positions and reset self.tape
-        grad = -self.E_array.grad.numpy()
-        grad[self.rebar_indices] = 0.0
-        # grad = 
-        self.optimizer.step([wp.array(grad, dtype=wp.float32)])
+        if not self.opt_slice:
+            grad = -self.E_array.grad.numpy()
+            if self.freeze_rebar:
+                grad[self.rebar_indices] = 0.0
+            self.optimizer.step([wp.array(grad, dtype=wp.float32)])
         # self.optimizer.step([-self.params.grad])
-        
+        else:
+            grad = -self.params.grad
+            self.optimizer.step([wp.array(grad, dtype=wp.float32)])
+
         self.tape.zero()
         print(loss.numpy().tolist(), grad)
         print(self.params.numpy().min(), self.params.numpy().max())
@@ -432,7 +483,7 @@ class Example:
                 fields={"u": self._u_field},
                 # at=fem.NodalQuadrature(fem.Cells(self._geo), self._u_space)
             )
-
+        self.E_hist.append(self._E_field.dof_values.numpy().tolist())
         return loss.numpy().tolist(), self.E_array.numpy().tolist()
 
 # import argparse
@@ -446,6 +497,8 @@ class Example:
 # speciman = args.obs
 # loadstep = args.snapshot
 
+freeze_rebar = True
+opt_slice = True
 specimen = "1"
 loadstep = "1"
 gauge_pitch = 0.0013 # mm
@@ -471,7 +524,9 @@ with wp.ScopedDevice("cuda:0"):
         # load=wp.vec3(200.0e3/0.000509, 0.0, 0.0),
         lr=1.0e8,
         strain_meas = strain_meas,
-        strain_meas_x = strain_meas_x
+        strain_meas_x = strain_meas_x,
+        freeze_rebar = freeze_rebar,
+        opt_slice = opt_slice,
     )
 
     losses = []
@@ -580,7 +635,7 @@ ax.set_xlabel('Iterations')
 ax.set_ylabel('E')
 ax.set_title('Adam Learning Curve')
 result_dict = {
-        "E_hist" : params,
+        "E_hist" : example.E_hist,
         "losses" : losses,
     }
 exp_name = f"3d_prism_test"
