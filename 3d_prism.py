@@ -450,10 +450,10 @@ specimen = "1"
 loadstep = "1"
 gauge_pitch = 0.0013 # mm
 # load target
-strain_meas_l = np.load(f'rebar_strains/s{specimen}_ls{loadstep}_l.npy', allow_pickle=True)
-strain_meas_r = np.load(f'rebar_strains/s{specimen}_ls{loadstep}_r.npy', allow_pickle=True)
-
-strain_meas = (strain_meas_l + strain_meas_r) *1e-6 / 2 
+# strain_meas_l = np.load(f'rebar_strains/s{specimen}_ls{loadstep}_l.npy', allow_pickle=True)
+# strain_meas_r = np.load(f'rebar_strains/s{specimen}_ls{loadstep}_r.npy', allow_pickle=True)
+# strain_meas = (strain_meas_l + strain_meas_r) *1e-6 / 2 
+strain_meas = np.load(f'rebar_strains/s{specimen}_ls{loadstep}_combined.npy', allow_pickle=True) * 1e-6
 strain_meas_x = np.arange(len(strain_meas)) * gauge_pitch
 # calculate load
 loads = np.array([22.2, 44.5, 89.0, 133.5, 177.9, 222.4]) * 1000
@@ -583,7 +583,7 @@ result_dict = {
         "E_hist" : params,
         "losses" : losses,
     }
-exp_name = f"3d_prism"
+exp_name = f"3d_prism_test"
 with open(f"results/{exp_name}.json", "w") as outfile: 
     json.dump(result_dict, outfile)
 
