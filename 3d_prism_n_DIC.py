@@ -8,6 +8,12 @@ from warp.optim import Adam
 import json
 
 @wp.kernel
+def clip_params_kernel(params: wp.array(dtype=float), lower_bound: float):
+    tid = wp.tid()
+    if params[tid] < lower_bound:
+        params[tid] = lower_bound
+
+@wp.kernel
 def map_slices_to_cells2(
     params: wp.array(dtype=float),
     concrete_indices: wp.array(dtype=int),
@@ -194,6 +200,7 @@ def loss_form(
     strain_meas_arr: wp.array(dtype=float),
     strain_est: wp.array(dtype=float),
     sensor_positions: wp.array(dtype=wp.vec3f),
+    weight: float,
 ):
     strain = strain_field(s, u)[0,0]
     strain_meas = strain_meas_arr[s.qp_index]
@@ -202,8 +209,22 @@ def loss_form(
     axial = 0.5 * (diff ** 2.0)# + (diff[1,1] ** 2.0) + (diff[2,2] ** 2.0))
     # stress_norm_sq = 0.5 * wp.ddot(diff, diff) * 1e20
     stress_norm_sq = axial * 1e20
-    return stress_norm_sq #* mask[s.qp_index]
+    return stress_norm_sq * weight 
 
+@fem.integrand
+def loss_form_DIC(
+    s: fem.Sample, 
+    domain: fem.Domain, 
+    u: fem.Field,
+    target_strain: wp.array(dtype=float),
+    weight: float,
+):
+    # Extract xx component of strain: [0,0]
+    strain = fem.D(u, s)[0,0]
+    strain_meas = target_strain[s.qp_index]
+    
+    diff = strain - strain_meas
+    return 0.5 * (diff * diff) * 1e20 * weight
 
 
 class Example:
@@ -219,9 +240,13 @@ class Example:
         lr=1.0e-3,
         strain_meas = None,
         strain_meas_x = None,
+        Exx = (None, None),
+        A_pos = (None, None),
+        B_pos = (None, None),
+        loss_weights = [1.0, 1.0, 1.0],
         u_meas = None,
         freeze_rebar = False,
-        opt_slice = False
+        opt_slice = False,
     ):
         self._quiet = quiet
         self.degree = degree
@@ -267,6 +292,26 @@ class Example:
         self.strain_est = wp.empty(extended_strain_np_reshape.shape, dtype=float, requires_grad=True)
         self.positions_sensors_np = np.transpose(np.meshgrid(strain_meas_x, target_vals, target_vals, indexing="ij"), axes=(1, 2, 3, 0)).reshape(-1, 3)
         self.positions_sensors = wp.array(self.positions_sensors_np, dtype=wp.vec3, requires_grad=True)
+
+        # --- DIC Data Processing ---
+        def prep_dic(x_grid, y_grid, exx_data, z_val):
+            pts = np.stack([x_grid.flatten(), y_grid.flatten(), np.full_like(x_grid.flatten(), z_val)], axis=-1)
+            return wp.array(pts, dtype=wp.vec3), wp.array(exx_data.flatten(), dtype=float)
+
+        self.strain_A, self.strain_B = Exx
+        A_x, A_y = A_pos
+        B_x, B_y = B_pos
+
+        # Side A (Z=0)
+        self.pos_A, self.strain_A = prep_dic(A_x, A_y, Exx_A, 0.0)
+        # Side B (Z=0.12)
+        self.pos_B, self.strain_B = prep_dic(B_x, B_y, Exx_B, 0.12)
+    
+
+        # Loss control weights (Set these via input or class args)
+        self.w_rebar = loss_weights[0]
+        self.w_sideA = loss_weights[1]
+        self.w_sideB = loss_weights[2]
 
         # print(extended_strain_np_reshape.shape, positions_sensors_np.shape)
         # sample = np.arange(100)
@@ -570,22 +615,47 @@ class Example:
 
         # Evaluate residual
         # Integral of squared difference between simulated position and target positions
-        loss = wp.empty(shape=1, dtype=wp.float32, requires_grad=True)
+        loss = wp.zeros(shape=1, dtype=wp.float32, requires_grad=True)
         with self.tape:
-            fem.integrate(
-                loss_form,
-                # loss_disp,
-                fields={"u": self._u_field, "u_meas": self._u_field_meas},
-                values={
-                    "mask": self.ab_mask, 
-                    "strain_meas_arr": self.strain_meas, 
-                    "strain_est": self.strain_est,
-                    "sensor_positions": self.positions_sensors
-                    },
-                domain=self.cells,
-                quadrature=fem.PicQuadrature(self.cells, self.positions_sensors),
-                output=loss,
-            )
+            if self.w_rebar > 0.0:
+                fem.integrate(
+                    loss_form,
+                    # loss_disp,
+                    fields={"u": self._u_field, "u_meas": self._u_field_meas},
+                    values={
+                        "mask": self.ab_mask, 
+                        "strain_meas_arr": self.strain_meas, 
+                        "strain_est": self.strain_est,
+                        "sensor_positions": self.positions_sensors,
+                        "weight": self.w_rebar,
+                        },
+                    domain=self.cells,
+                    quadrature=fem.PicQuadrature(self.cells, self.positions_sensors),
+                    output=loss,
+                    add=True
+                )
+            if self.w_sideA > 0.0:
+                fem.integrate(
+                    loss_form_DIC,
+                    fields={"u": self._u_field},
+                    values={"target_strain": self.strain_A, "weight": self.w_sideA},
+                    domain=self.cells,
+                    quadrature=fem.PicQuadrature(self.cells, self.pos_A),
+                    output=loss,
+                    add=True
+                )
+
+            # 3. Side B DIC Loss
+            if self.w_sideB > 0.0:
+                fem.integrate(
+                    loss_form_DIC,
+                    fields={"u": self._u_field},
+                    values={"target_strain": self.strain_B, "weight": self.w_sideB},
+                    domain=self.cells,
+                    quadrature=fem.PicQuadrature(self.cells, self.pos_B),
+                    output=loss,
+                    add=True
+                )
 
         # perform backward step
         self.tape.backward(loss=loss)
@@ -604,9 +674,15 @@ class Example:
             grad = -self.params.grad
             self.optimizer.step([wp.array(grad, dtype=wp.float32)])
 
+        wp.launch(
+            kernel=clip_params_kernel,
+            dim=len(self.params),
+            inputs=[self.params, 0.0] 
+        )
+
         self.tape.zero()
         # print(loss.numpy(), self.params.numpy().min(), self.params.numpy().max())#.tolist(), grad)
-        # print(self.params.numpy().min(), self.params.numpy().max())
+        # print(loss.numpy(), self.params.numpy().min(), self.params.numpy().max())
         # print(grad)
         self.strain_field = self.strain_space_meas.make_field()
         fem.interpolate(
@@ -616,7 +692,7 @@ class Example:
                 # at=fem.NodalQuadrature(fem.Cells(self._geo), self._u_space)
             )
         self.E_hist.append(self._E_field.dof_values.numpy().tolist())
-        return loss.numpy().tolist(), self.E_array.numpy().tolist()
+        return loss.numpy().tolist(), self.E_array.numpy().tolist(), self.strain_est.numpy().tolist()
 
 import argparse
 # Parse command-line arguments
@@ -626,6 +702,9 @@ parser.add_argument("loadstep", type=str)
 parser.add_argument("freeze_rebar", type=str)
 parser.add_argument("opt_slice", type=str)
 parser.add_argument("lr", type=str)
+parser.add_argument("w_rebar", type=str)
+parser.add_argument("w_A", type=str)
+parser.add_argument("w_B", type=str)
 parser.add_argument("step", type=str)
 
 args = parser.parse_args()
@@ -635,7 +714,13 @@ loadstep = args.loadstep
 freeze_rebar = bool(int(args.freeze_rebar))
 opt_slice = bool(int(args.opt_slice))
 lr = int(float(args.lr))
+weights = [
+    float(args.w_rebar),
+    float(args.w_A),
+    float(args.w_B),
+]
 step = int(float(args.step))
+
 # freeze_rebar = False
 # opt_slice = True
 # specimen = "1"
@@ -649,6 +734,20 @@ gauge_pitch = 0.0013 # mm
 print('loading target')
 strain_meas = np.load(f'rebar_strains/s{specimen}_ls{loadstep}_combined.npy', allow_pickle=True) * 1e-6
 strain_meas_x = np.arange(len(strain_meas)) * gauge_pitch
+
+if loadstep=='1':
+    kips = '5'
+Exx_A = np.load(f'DIC/S{specimen}A_{kips}k_Exx_rcr_trim.npy')
+Exx_B = np.load(f'DIC/S{specimen}B_{kips}k_Exx_rcr_trim.npy')
+
+A_x = np.linspace(0,1,Exx_A.shape[1], endpoint=True)
+A_y = np.linspace(0,0.12,Exx_A.shape[0], endpoint=True)
+A_x, A_y = np.meshgrid(A_x, A_y)
+
+B_x = np.linspace(0,1,Exx_B.shape[1], endpoint=True)
+B_y = np.linspace(0,0.12,Exx_B.shape[0], endpoint=True)
+B_x, B_y = np.meshgrid(B_x, B_y)
+
 # calculate load
 if specimen in ['1', '2', '3']:
     loads = np.array([22.2, 44.5, 89.0, 89.0, 133.5, 177.9]) * 1000
@@ -666,22 +765,28 @@ with wp.ScopedDevice("cuda:0"):
         mesh="quad",
         poisson_ratio=0.3,
         load=wp.vec3(load/0.000509, 0.0, 0.0),
-        # load=wp.vec3(200.0e3/0.000509, 0.0, 0.0),
         lr=lr,
         strain_meas = strain_meas,
         strain_meas_x = strain_meas_x,
+        Exx = (Exx_A, Exx_B),
+        A_pos = (A_x, A_y),
+        B_pos = (B_x, B_y),
+        loss_weights = weights,
         freeze_rebar = freeze_rebar,
         opt_slice = opt_slice,
     )
 
     losses = []
     params = []
+    strains = []
     n_its = step
     from tqdm import tqdm
-    for _ in tqdm(np.arange(n_its)):
-        loss, param = example.step()
+    # for _ in tqdm(np.arange(n_its)):
+    for _ in range(n_its):
+        loss, param, strain = example.step()
         losses.append(loss)
         params.append(param)
+        strains.append(strain)
 
 
 
@@ -695,6 +800,7 @@ disp_est = example._u_field.dof_values.numpy()
 
 best_index = np.argmin(losses)
 E_best = params[best_index]
+strain_best = strains[best_index]
 
 node_positions = example._u_space.node_positions().numpy()
 E_meas = example._E_field_meas.dof_values.numpy()
@@ -709,7 +815,7 @@ E_max = np.max((np.max(E_meas), np.max(E_est), np.max(example.init_E)))
 
 node_positions = example._u_space.node_positions().numpy()
 disp_meas = example._u_field_meas.dof_values.numpy()
-strain_res  = example.strain_field.dof_values.numpy()  
+strain_res  = example.strain_field.dof_values.numpy()
 
 node_positions = example._u_space.node_positions().numpy()
 E_meas = example._E_field_meas.dof_values.numpy()
@@ -736,7 +842,7 @@ rebar_mask = (
 )
 
 counts = np.unique_counts(E_est)
-print('counts',np.max(counts.counts), counts.values[np.argmax(counts.counts)])
+# print('counts',np.max(counts.counts), counts.values[np.argmax(counts.counts)])
 
 actual_disp_end = np.mean(disp_meas[rebar_mask, 0][-4:])
 integrated_strain = strain_res[rebar_mask,0,0].sum()*dx/4
@@ -758,7 +864,7 @@ eps_est_avg = []
 
 for xi in x_s_unique:
     mask_x = x_s_rounded == xi
-    eps_est_avg.append(np.mean(example.strain_est.numpy()[mask_x]))
+    eps_est_avg.append(np.mean(np.array(strain_best)[mask_x]))
 eps_est_avg = np.array(eps_est_avg)
 
 
@@ -802,12 +908,12 @@ ax.plot(np.arange(n_its), params)
 ax.hlines(25e9, 0, n_its, color='r', alpha=0.4)
 ax.set_xlabel('Iterations')
 ax.set_ylabel('E')
-ax.set_title('Adam Learning Curve')
+ax.set_title(f'Adam Learning Curve, lr={lr}')
 result_dict = {
         "E_hist" : example.E_hist,
         "losses" : losses,
     }
-exp_name = f"3d_prism_s{specimen}_ls{loadstep}_freeze_{freeze_rebar}_slice_{opt_slice}_lr_{lr}_steps_{step}"
+exp_name = f"3d_prism_n_DIC_s{specimen}_ls{loadstep}_weights_{[str(i) for i in weights]}_freeze_{freeze_rebar}_slice_{opt_slice}_lr_{lr}_steps_{step}"
 with open(f"results/{exp_name}.json", "w") as outfile: 
     json.dump(result_dict, outfile)
 
@@ -821,81 +927,9 @@ ax.set_ylabel(r"$\varepsilon_{xx}$")
 ax.set_title("Longitudinal strain in rebar (y–z averaged)")
 ax.legend()
 
-plt.savefig(f"figures/{exp_name}.png", dpi=300)
+plt.savefig(f"figures/3d_prism_n_DIC/{exp_name}_LC.png", dpi=300)
 # plt.show()
 
-
-# # Get data
-# node_positions = example._u_space.node_positions().numpy()
-# disp_meas = example._u_field_meas.dof_values.numpy()
-# disp_est = example._u_field.dof_values.numpy()
-# # strain_meas = example.strain_field_meas.dof_values.numpy()
-# # strain_est = example.strain_field.dof_values.numpy()
-
-# best_index = np.argmin(losses)
-# E_best = params[best_index]
-
-# node_positions = example._u_space.node_positions().numpy()
-# E_meas = example._E_field_meas.dof_values.numpy()
-# E_est = example._E_field.dof_values.numpy()
-
-# disp_min = np.min((np.min(disp_meas[:,0]), np.min(disp_est[:,0])))
-# disp_max = np.max((np.max(disp_meas[:,0]), np.max(disp_est[:,0])))
-# # strain_min = np.min((np.min(strain_meas[:,0,0]), np.min(strain_est[:,0,0])))
-# # strain_max = np.max((np.max(strain_meas[:,0,0]), np.max(strain_est[:,0,0])))
-# E_min = np.min((np.min(E_meas), np.min(E_est), np.min(example.init_E), np.min(E_best)))
-# E_max = np.max((np.max(E_meas), np.max(E_est), np.max(example.init_E)))
-
-# node_positions = example._u_space.node_positions().numpy()
-# disp_meas = example._u_field_meas.dof_values.numpy()
-# strain_meas = example.strain_field_meas.dof_values.numpy()
-
-
-# node_positions = example._u_space.node_positions().numpy()
-# E_meas = example._E_field_meas.dof_values.numpy()
-
-# P = load
-# A = example.resolution[1] * example.resolution[2]
-# E = np.mean(E_meas)
-# L = 1.0
-# dx = L / 100
-# theoretical_strain = P / (A * E)
-# theoretical_displacement = P * 1 / (A*E)
-# theoretical_displacement_rebar = P * 1 / (((0.0713-0.0487)**2)*200e9)
-# measured_strain = strain_meas[:, 0, 0]
-
-# lo = int(measured_strain.shape[0]*3/8)
-# hi = int(measured_strain.shape[0]*5/8)
-
-# end_node_mask = node_positions[:, 0] > 0.999
-# y = node_positions[:, 1]
-# z = node_positions[:, 2]
-# rebar_mask = (
-#     (y >= 0.0486) & (y <= 0.0713) &
-#     (z >= 0.0486) & (z <= 0.0713)
-# )
-
-# print(theoretical_strain)
-# print(np.mean(measured_strain), np.median(measured_strain))
-# print(np.mean(measured_strain[lo:hi]))
-# print(theoretical_displacement)
-# print(disp_meas[-30:,0])
-# print(strain_meas[:,0,0].sum()*dx/4)
-# print(node_positions.shape)
-# print(disp_meas.shape)
-# print(strain_meas.shape)
-# print(sum(rebar_mask))
-
-
-# actual_disp_end = np.mean(disp_meas[rebar_mask, 0][-4:])
-# integrated_strain = strain_meas[rebar_mask,0,0].sum()*dx/4
-
-# print(f"Theoretical Displacement at end (concrete and rebar): {theoretical_displacement:.6e}")
-# print(f"Theoretical Displacement at end (rebar only): {theoretical_displacement_rebar:.6e}")
-# print(f"Simulated Displacement at end (u_L): {actual_disp_end:.6e}")
-# print(f"Simulated Integrated strain (sum(epsilon) * dx): {integrated_strain:.6e}")
-# print(f"Measured Integrated strain (sum(epsilon) * dx): {strain_meas.sum()*0.0013:.6e}")
-# # print(f"Difference: {abs(actual_disp_end - integrated_strain):.6e}")
 
 
 
@@ -913,32 +947,11 @@ values = example._E_field_meas.dof_values.numpy()
 grid = pyvista.UnstructuredGrid(cells, types, nodes)
 
 plotter = pyvista.Plotter(off_screen=True)
-grid.cell_data["values"] = E_est
+grid.cell_data["values"] = E_meas
 plotter.add_mesh(grid, clim=[vmin, vmax], show_edges=True)
 plotter.add_title("True Elastic Field")
 plotter.show_axes()
-# plotter.show(screenshot=f"figures/{exp_name}_meas.png", window_size=(1800,1200))
 
-# plotter = pyvista.Plotter(off_screen=True,)
-# grid.cell_data["values"] = E_est
-# plotter.add_mesh(grid, clim=[vmin, vmax], show_edges=True)
-# plotter.add_title("Estimated Elastic Field")
-# plotter.show_axes()
-# plotter.show(screenshot=f"figures/{exp_name}_est.png", window_size=(1800,1200))
-
-# plotter = pyvista.Plotter(off_screen=True,)
-# grid.cell_data["values"] = E_best
-# plotter.add_mesh(grid, clim=[vmin, vmax], show_edges=True)
-# plotter.add_title("Best Estimated Elastic Field")
-# plotter.show_axes()
-# plotter.show(screenshot=f"figures/{exp_name}_best.png", window_size=(1800,1200))
-
-# plotter = pyvista.Plotter(off_screen=True,)
-# grid.cell_data["values"] = example.init_E
-# plotter.add_mesh(grid, clim=[vmin, vmax], show_edges=True)
-# plotter.add_title("Initial Elastic Field")
-# plotter.show_axes()
-# plotter.show(screenshot=f"figures/{exp_name}_init.png", window_size=(1800,1200))
 
 grid.cell_data["values"] = E_best
 centers = grid.cell_centers().points
@@ -949,27 +962,130 @@ z = centers[:,2]
 z_unique = np.unique(z)
 
 
-fig, axes = plt.subplots(len(z_unique)+1, 1, figsize=(12, 12), layout='constrained')
-scatter_list = []
+fig, axes = plt.subplots(len(z_unique)+3, 1, figsize=(12, 12), layout='constrained')
 
-# Plot the X-Y slices for each z
+im_E_list = []
+im_strain_list = []
+
+# --- Shared scale for E fields ---
+vmin_E = vmin
+vmax_E = vmax
+
+# --- Shared scale for strain fields ---
+vmin_strain = min(np.nanpercentile(Exx_A, 1), np.nanpercentile(Exx_B, 1))
+vmax_strain = max(np.nanpercentile(Exx_A, 99), np.nanpercentile(Exx_B, 99))
+
+# --- 3D slices (E fields) ---
 for i, zi in enumerate(z_unique):
     mask = z == zi
     E_val = grid.cell_data["values"][mask]
     coords = centers[mask][:, :2]
 
+    x_vals = coords[:, 0]
+    y_vals = coords[:, 1]
+
+    x_unique = np.unique(x_vals)
+    y_unique = np.unique(y_vals)
+
+    grid_E = np.full((len(y_unique), len(x_unique)), np.nan)
+
+    x_idx = np.searchsorted(x_unique, x_vals)
+    y_idx = np.searchsorted(y_unique, y_vals)
+
+    grid_E[y_idx, x_idx] = E_val
+
     ax = axes[i]
+    im = ax.imshow(
+        grid_E,
+        origin='lower',
+        extent=[x_unique.min(), x_unique.max(), y_unique.min(), y_unique.max()],
+        cmap='jet',
+        vmin=vmin_E,
+        vmax=vmax_E,
+        aspect='auto'
+    )
+
     ax.set_xlabel('x')
     ax.set_ylabel('y')
-    scatter = ax.scatter(coords[:, 0], coords[:, 1], c=E_val, cmap='jet', vmin=vmin, vmax=vmax)
-    scatter_list.append(scatter)
+    ax.set_title(f'z = {zi:.3f}')
 
-# Add a single horizontal colorbar on top of the figure
-cbar = fig.colorbar(scatter_list[0], ax=axes[:len(z_unique)], orientation='horizontal', pad=0.01, aspect=50)
-cbar.set_label("Young's Modulus (Pa)")
+    im_E_list.append(im)
 
-# Plot longitudinal strain in the bottom subplot
-ax = axes[len(z_unique)]
+# --- Strain images ---
+idx_A = len(z_unique)
+idx_B = len(z_unique) + 1
+
+imA = axes[idx_A].imshow(
+    Exx_A,
+    origin='lower',
+    cmap='jet',
+    vmin=vmin_strain,
+    vmax=vmax_strain
+)
+axes[idx_A].set_title(r'$\epsilon_{xx}$, Side A')
+
+imB = axes[idx_B].imshow(
+    Exx_B,
+    origin='lower',
+    cmap='jet',
+    vmin=vmin_strain,
+    vmax=vmax_strain
+)
+axes[idx_B].set_title(r'$\epsilon_{xx}$, Side B')
+
+im_strain_list.extend([imA, imB])
+
+# --- Colorbar for E fields ---
+cbar_E = fig.colorbar(
+    im_E_list[0],
+    ax=axes[:len(z_unique)],
+    orientation='horizontal',
+    pad=0.02,
+    aspect=50
+)
+cbar_E.set_label("Young's Modulus (Pa)")
+
+# --- Colorbar for strain fields ---
+cbar_strain = fig.colorbar(
+    im_strain_list[0],
+    ax=axes[len(z_unique):len(z_unique)+2],
+    orientation='horizontal',
+    pad=0.02,
+    aspect=50
+)
+cbar_strain.set_label(r'$\epsilon_{xx}$')
+
+# Get reference extent from slices
+x_min = x_unique.min()
+x_max = x_unique.max()
+y_min = y_unique.min()
+y_max = y_unique.max()
+
+# --- Strain images ---
+imA = axes[idx_A].imshow(
+    Exx_A,
+    origin='lower',
+    cmap='jet',
+    vmin=vmin_strain,
+    vmax=vmax_strain,
+    extent=[x_min, x_max, y_min, y_max],  # 🔥 key line
+    aspect='auto'
+)
+axes[idx_A].set_title(r'$\epsilon_{xx}$, Side A')
+
+imB = axes[idx_B].imshow(
+    Exx_B,
+    origin='lower',
+    cmap='jet',
+    vmin=vmin_strain,
+    vmax=vmax_strain,
+    extent=[x_min, x_max, y_min, y_max],  # 🔥 key line
+    aspect='auto'
+)
+axes[idx_B].set_title(r'$\epsilon_{xx}$, Side B')
+
+# --- Bottom plot ---
+ax = axes[len(z_unique)+2]
 ax.plot(strain_meas_x, strain_meas, label="Measured strain", lw=2)
 ax.plot(x_s_unique, eps_est_avg, label="Estimated strain", lw=2, linestyle="--")
 ax.hlines(theoretical_displacement_rebar, 0, 1, color='r', label="Theoretical Max Rebar Strain")
@@ -979,5 +1095,134 @@ ax.set_ylabel(r"$\varepsilon_{xx}$")
 ax.set_title("Longitudinal strain in rebar (y–z averaged)")
 ax.legend()
 
-plt.savefig(f"figures/{exp_name}_slices.png", dpi=300)
-# plt.show()
+
+    
+
+plt.savefig(f"figures/3d_prism_n_DIC/{exp_name}_E.png", dpi=300)
+
+
+
+# --- Node data ---
+nodes = node_positions  # (N, 3)
+x_nodes = nodes[:, 0]
+y_nodes = nodes[:, 1]
+z_nodes = nodes[:, 2]
+
+# --- Simulated strain (nodal) ---
+strain_xx = strain_res[:, 0, 0]
+
+# Robust z slicing (handle float precision)
+z_unique = np.unique(np.round(z_nodes, decimals=6))
+n_slices = len(z_unique)
+
+fig, axes = plt.subplots(n_slices + 3, 1, figsize=(12, 12), layout='constrained')
+
+im_strain3D_list = []
+im_dic_list = []
+
+# --- Scales ---
+vmin_sim = np.nanpercentile(strain_xx, 1)
+vmax_sim = np.nanpercentile(strain_xx, 99)
+
+vmin_dic = min(np.nanpercentile(Exx_A, 1), np.nanpercentile(Exx_B, 1))
+vmax_dic = max(np.nanpercentile(Exx_A, 99), np.nanpercentile(Exx_B, 99))
+
+# --- 3D strain slices (NODE-BASED) ---
+for i, zi in enumerate(z_unique):
+    mask = np.isclose(z_nodes, zi)
+
+    strain_val = strain_xx[mask]
+    x_vals = x_nodes[mask]
+    y_vals = y_nodes[mask]
+
+    x_unique = np.unique(x_vals)
+    y_unique = np.unique(y_vals)
+
+    grid_strain = np.full((len(y_unique), len(x_unique)), np.nan)
+
+    x_idx = np.searchsorted(x_unique, x_vals)
+    y_idx = np.searchsorted(y_unique, y_vals)
+
+    grid_strain[y_idx, x_idx] = strain_val
+
+    ax = axes[i]
+    im = ax.imshow(
+        grid_strain,
+        origin='lower',
+        extent=[x_unique.min(), x_unique.max(), y_unique.min(), y_unique.max()],
+        cmap='jet',
+        vmin=vmin_sim,
+        vmax=vmax_sim,
+        aspect='auto'
+    )
+
+    ax.set_xlabel('x')
+    ax.set_ylabel('y')
+    ax.set_title(f'Simulated $\\epsilon_{{xx}}$, z = {zi:.3f}')
+
+    im_strain3D_list.append(im)
+
+# --- Use last slice extent for alignment ---
+x_min, x_max = x_unique.min(), x_unique.max()
+y_min, y_max = y_unique.min(), y_unique.max()
+
+# --- DIC strain images ---
+idx_A = n_slices
+idx_B = n_slices + 1
+
+imA = axes[idx_A].imshow(
+    Exx_A,
+    origin='lower',
+    cmap='jet',
+    vmin=vmin_dic,
+    vmax=vmax_dic,
+    extent=[x_min, x_max, y_min, y_max],
+    aspect='auto'
+)
+axes[idx_A].set_title(r'DIC $\epsilon_{xx}$, Side A')
+
+imB = axes[idx_B].imshow(
+    Exx_B,
+    origin='lower',
+    cmap='jet',
+    vmin=vmin_dic,
+    vmax=vmax_dic,
+    extent=[x_min, x_max, y_min, y_max],
+    aspect='auto'
+)
+axes[idx_B].set_title(r'DIC $\epsilon_{xx}$, Side B')
+
+im_dic_list.extend([imA, imB])
+
+# --- Colorbar: simulated strain ---
+cbar_sim = fig.colorbar(
+    im_strain3D_list[0],
+    ax=axes[:n_slices],
+    orientation='horizontal',
+    pad=0.02,
+    aspect=50
+)
+cbar_sim.set_label(r"Simulated $\epsilon_{xx}$")
+
+# --- Colorbar: DIC strain ---
+cbar_dic = fig.colorbar(
+    im_dic_list[0],
+    ax=axes[n_slices:n_slices+2],
+    orientation='horizontal',
+    pad=0.02,
+    aspect=50
+)
+cbar_dic.set_label(r"DIC $\epsilon_{xx}$")
+
+# --- Bottom plot ---
+ax = axes[n_slices + 2]
+ax.plot(strain_meas_x, strain_meas, label="Measured strain", lw=2)
+ax.plot(x_s_unique, eps_est_avg, label="Estimated strain", lw=2, linestyle="--")
+ax.hlines(theoretical_displacement_rebar, 0, 1, color='r', label="Theoretical Max Rebar Strain")
+ax.hlines(theoretical_displacement, 0, 1, color='0.5', label="Theoretical Min Combined Strain")
+ax.set_xlabel("x")
+ax.set_ylabel(r"$\varepsilon_{xx}$")
+ax.set_title("Longitudinal strain in rebar (y–z averaged)")
+ax.legend()
+
+plt.savefig(f"figures/3d_prism_n_DIC/{exp_name}_strain.png", dpi=300)

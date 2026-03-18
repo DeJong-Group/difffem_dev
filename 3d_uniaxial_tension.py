@@ -343,7 +343,7 @@ with wp.ScopedDevice(None):
     example = Example(
         quiet=True,
         degree=1,
-        resolution=(10, 2, 2),
+        resolution=(25, 3, 3),
         mesh="tri",
         poisson_ratio=0.3,
         load=wp.vec3(2.0e3*10.0, 0.0, 0.0),
@@ -362,11 +362,12 @@ strain_meas = example.strain_field_meas.dof_values.numpy()
 node_positions = example._u_space.node_positions().numpy()
 E_meas = example._E_field_meas.dof_values.numpy()
 
-P = example.load[0] * example.resolution[1] * example.resolution[2]
-A = example.resolution[1] * example.resolution[2]
-E = np.mean(E_meas)
+
+A = 0.12*0.12
+P = example.load[0] * A
+E = 25e9
 L = 1.0
-dx = L / 11
+dx = L / (25+1)
 theoretical_strain = P / (A * E)
 theoretical_displacement = P * 1 / (A*E)
 measured_strain = strain_meas[:, 0, 0]
@@ -385,6 +386,8 @@ print(disp_meas.shape)
 end_node_mask = node_positions[:, 0] > 0.999 
 actual_disp_end = np.mean(disp_meas[end_node_mask, 0])
 
+print(P, A, E, )
+
 # 2. Integrate Strain along the X-axis
 # In a uniform mesh, the integral of strain is approximately mean(strain) * Length
 avg_strain_xx = np.mean(strain_meas[:, 0, 0])
@@ -393,7 +396,7 @@ integrated_strain = avg_strain_xx * L
 
 print(f"Theoretical Displacement at end (u_L): {theoretical_displacement:.6e}")
 print(f"Displacement at end (u_L): {actual_disp_end:.6e}")
-print(f"Integrated strain (sum(epsilon) * dx): {strain_meas[:,0,0].sum()*dx/9:.6e}")
+print(f"Integrated strain (sum(epsilon) * dx): {strain_meas[:,0,0].sum()*dx/16:.6e}")
 print(f"Difference: {abs(actual_disp_end - integrated_strain):.6e}")
 
 # # 1.

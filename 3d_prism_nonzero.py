@@ -7,6 +7,94 @@ from warp.optim import Adam
 
 import json
 
+@wp.kernel
+def clip_params_kernel(params: wp.array(dtype=float), lower_bound: float):
+    tid = wp.tid()
+    if params[tid] < lower_bound:
+        params[tid] = lower_bound
+
+@wp.kernel
+def map_slices_to_cells2(
+    params: wp.array(dtype=float),
+    concrete_indices: wp.array(dtype=int),
+    rebar_indices: wp.array(dtype=int),
+    cell_slice_map_concrete: wp.array(dtype=int),
+    cell_slice_map_rebar: wp.array(dtype=int),
+    full_E_field: wp.array(dtype=float),
+    n_slices: int,
+    n_concrete: int,
+    n_rebar: int,
+    freeze_rebar: bool,
+    rebar_static_val: float
+):
+    tid = wp.tid()
+    
+    # Map Concrete Slices
+    if tid < n_concrete:
+        c_idx = concrete_indices[tid]
+        s_idx = cell_slice_map_concrete[tid]
+        # Concrete parameters are in the first track: [0 : n_slices]
+        full_E_field[c_idx] = params[s_idx]
+        
+    # Map Rebar Slices
+    if tid < n_rebar:
+        r_idx = rebar_indices[tid]
+        if freeze_rebar:
+            full_E_field[r_idx] = rebar_static_val
+        else:
+            # s_idx = cell_slice_map_rebar[tid]
+            # Rebar parameters are in the second track: [n_slices : 2*n_slices]
+            full_E_field[r_idx] = params[n_slices]# + s_idx]
+
+@wp.kernel
+def map_rebar(
+    params: wp.array(dtype=float),
+    concrete_indices: wp.array(dtype=int),
+    rebar_indices: wp.array(dtype=int),
+    cell_slice_map_concrete: wp.array(dtype=int),
+    cell_slice_map_rebar: wp.array(dtype=int),
+    full_E_field: wp.array(dtype=float),
+    n_slices: int,
+    n_concrete: int,
+    n_rebar: int,
+    freeze_rebar: bool,
+    rebar_static_val: float,
+):
+    tid = wp.tid()
+    # Map Concrete Slices
+    if tid < n_concrete:
+        c_idx = concrete_indices[tid]
+        s_idx = cell_slice_map_concrete[tid]
+        # Concrete parameters are in the first track: [0 : n_slices]
+        full_E_field[c_idx] = params[s_idx]
+    # Map Rebar Slices
+    if tid < n_rebar:
+        r_idx = rebar_indices[tid]
+        if freeze_rebar:
+            full_E_field[r_idx] = rebar_static_val
+        else:
+            # s_idx = cell_slice_map_rebar[tid]
+            # Rebar parameters are in the second track: [n_slices : 2*n_slices]
+            full_E_field[r_idx] = params[n_concrete]
+
+@wp.kernel
+def map_slices_to_cells(
+    slice_values: wp.array(dtype=float),
+    cell_slice_map: wp.array(dtype=int),
+    concrete_indices: wp.array(dtype=int),
+    n_concrete: int,
+    full_E_field: wp.array(dtype=float),
+    rebar_E: float,
+    rebar_indices: wp.array(dtype=int)
+):
+    tid = wp.tid()
+    # Map concrete
+    if tid < n_concrete:
+        c_idx = concrete_indices[tid]
+        s_idx = cell_slice_map[tid]
+        full_E_field[c_idx] = slice_values[s_idx]
+    
+
 @wp.func
 def lame_from_E_nu(E: float, nu: float) -> wp.vec2:
     # λ = Eν / ((1+ν)(1−2ν)),  μ = E / (2(1+ν))
@@ -109,11 +197,15 @@ def loss_form(
     u: fem.Field,
     u_meas: fem.Field, 
     mask: wp.array(dtype=int),
+    strain_meas_arr: wp.array(dtype=float),
+    strain_est: wp.array(dtype=float),
+    sensor_positions: wp.array(dtype=wp.vec3f),
 ):
-    strain = strain_field(s, u)
-    strain_meas = strain_field(s, u_meas)
+    strain = strain_field(s, u)[0,0]
+    strain_meas = strain_meas_arr[s.qp_index]
+    strain_est[s.qp_index] = strain
     diff = (strain - strain_meas)
-    axial = 0.5 * (diff[0,0] ** 2.0)# + (diff[1,1] ** 2.0))
+    axial = 0.5 * (diff ** 2.0)# + (diff[1,1] ** 2.0) + (diff[2,2] ** 2.0))
     # stress_norm_sq = 0.5 * wp.ddot(diff, diff) * 1e20
     stress_norm_sq = axial * 1e20
     return stress_norm_sq #* mask[s.qp_index]
@@ -134,6 +226,8 @@ class Example:
         strain_meas = None,
         strain_meas_x = None,
         u_meas = None,
+        freeze_rebar = False,
+        opt_slice = False
     ):
         self._quiet = quiet
         self.degree = degree
@@ -143,7 +237,9 @@ class Example:
         bounds_hi = wp.vec3(1.0, 0.12, 0.12)
         self._initial_volume = (bounds_hi - bounds_lo)[0] * (bounds_hi - bounds_lo)[1] * (bounds_hi - bounds_lo)[2]
         
-        
+        # optimization settings
+        self.freeze_rebar = freeze_rebar
+        self.opt_slice = opt_slice
 
         self.u_meas = u_meas
 
@@ -171,17 +267,18 @@ class Example:
 
         # self.rebar_indices = np.where(y_mask & z_mask)[0]
         n_sensor = len(strain_meas)
-        extended_strain_np = np.broadcast_to(strain_meas[:, None, None], (n_sensor, self.Ny+1, self.Nz+1))
+        extended_strain_np = np.broadcast_to(strain_meas[:, None, None], (n_sensor, 2, 2))
         extended_strain_np_reshape = extended_strain_np.reshape(-1)
         self.strain_meas = wp.from_numpy(extended_strain_np_reshape, dtype=float, requires_grad=True)
-        positions_sensors_np = np.transpose(np.meshgrid(strain_meas_x, node_y, node_z, indexing="ij"), axes=(1, 2, 3, 0)).reshape(-1, 3)
-        self.positions_sensors = wp.array(positions_sensors_np, dtype=wp.vec3, requires_grad=True)
+        self.strain_est = wp.empty(extended_strain_np_reshape.shape, dtype=float, requires_grad=True)
+        self.positions_sensors_np = np.transpose(np.meshgrid(strain_meas_x, target_vals, target_vals, indexing="ij"), axes=(1, 2, 3, 0)).reshape(-1, 3)
+        self.positions_sensors = wp.array(self.positions_sensors_np, dtype=wp.vec3, requires_grad=True)
 
         # print(extended_strain_np_reshape.shape, positions_sensors_np.shape)
         # sample = np.arange(100)
         # for i in sample:
         #     print(i, positions_sensors_np[i], extended_strain_np_reshape[i])
-        print(positions_sensors_np)
+        # print(positions_sensors_np)
         # print(extended_strain_np_reshape)
         if mesh == "tri":
             # triangle mesh, optimize vertices directly
@@ -230,7 +327,7 @@ class Example:
         right_mask = wp.zeros(shape=boundary.element_count(), dtype=int)
         # self.ab_mask = wp.zeros(shape=boundary.element_count(), dtype=float)
         self.ab_mask = wp.zeros(shape=self.cells.element_count(), dtype=int)
-        print("cells: ", boundary.element_count(), self.cells.element_count())
+        # print("cells: ", boundary.element_count(), self.cells.element_count())
         
         fem.interpolate(
             classify_boundary_sides,
@@ -284,8 +381,8 @@ class Example:
         # damage_idx_start = int(E_space_meas.node_count()*0.5)# - ((resolution[1]+1)*(resolution[2]+1))//2
         # damage_idx_width = int((resolution[1]+1)*(resolution[2]+1))
         damage_idx = np.arange(damage_idx_start, damage_idx_start+damage_idx_width)
-        # E_meas_init[damage_idx] = 25.0e9*0.9
-        # E_meas_init[self.rebar_indices] = 200.0e9
+        E_meas_init[damage_idx] = 25.0e9*0.9
+        E_meas_init[self.rebar_indices] = 200.0e9
 
 
         
@@ -329,15 +426,105 @@ class Example:
         # Current implementation assumes scalar arrays, so cast our vec2 arrays to scalars
         self.E_space = fem.make_polynomial_space(self._geo, degree=0, dtype=float)
         N = self.E_space.node_count()
-        self.init_E = np.zeros(N)+30.0e9
-        # self.init_E[self.rebar_indices] = 200.0e9
+        self.init_E = np.zeros(N)+25.0e9
+        self.init_E[self.rebar_indices] = 200.0e9
         self.E_array = wp.array(self.init_E, dtype=float, requires_grad=True)
-        self.params = wp.array(self.E_array, dtype=wp.float32).flatten()
-        self.params.grad = wp.array(self.E_array.grad, dtype=wp.float32).flatten()
+        self.E_hist = []
+        if not self.opt_slice:
+            if self.freeze_rebar:
+                self.params = wp.array(self.E_array, dtype=wp.float32).flatten()
+                self.params.grad = wp.array(self.E_array.grad, dtype=wp.float32).flatten()
+            else:
+                self.num_slices = self.Nx 
+                all_cells = np.arange(self._geo.cell_count())
+                self.concrete_indices = np.delete(all_cells, self.rebar_indices)
+                self.n_concrete = len(self.concrete_indices)
+                self.n_rebar = len(self.rebar_indices)
+                self.cell_slice_map_concrete = wp.array(np.arange(self.n_concrete), dtype=int)
+                self.cell_slice_map_rebar = wp.array((self.rebar_indices // (self.Ny * self.Nz)).astype(int), dtype=int)
+                
+                c_init = np.full(self.n_concrete, 25.0e9, dtype=np.float32)
+                r_init = np.array([200.0e9], dtype=np.float32)
+                init_params = np.concatenate([c_init, r_init])
+                self.params = wp.array(init_params, dtype=wp.float32, requires_grad=True)
+        else:
+            self.num_slices = self.Nx 
+            all_cells = np.arange(self._geo.cell_count())
+            self.concrete_indices = np.delete(all_cells, self.rebar_indices)
+            self.cell_slice_map_concrete = wp.array((self.concrete_indices // (self.Ny * self.Nz)).astype(int), dtype=int)
+            self.cell_slice_map_rebar = wp.array((self.rebar_indices // (self.Ny * self.Nz)).astype(int), dtype=int)
+            self.n_concrete = len(self.concrete_indices)
+            self.n_rebar = len(self.rebar_indices)
+            # self.cell_slice_map = (self.concrete_indices // (self.Ny * self.Nz)).astype(int)
+            # self.slice_E_init = np.full(self.num_slices, 25.0e9, dtype=np.float32)
+            # self.params = wp.array(self.slice_E_init, dtype=wp.float32, requires_grad=True)
+            if self.freeze_rebar:
+                # Only Concrete Slices
+                init_params = np.full(self.num_slices, 25.0e9, dtype=np.float32)
+            else:
+                # Concatenate Concrete slices and Rebar slices
+                c_slices = np.full(self.num_slices, 25.0e9, dtype=np.float32)
+                r_slices = np.array([200.0e9], dtype=np.float32)
+                init_params = np.concatenate([c_slices, r_slices])
+            
+            self.params = wp.array(init_params, dtype=wp.float32, requires_grad=True)
         self.optimizer = Adam([self.params], lr=self.lr)
 
     def step(self):
         self.tape = wp.Tape()
+        if self.opt_slice:
+            # with self.tape:
+            #     wp.launch(
+            #         kernel=map_slices_to_cells,
+            #         dim=self._geo.cell_count(),
+            #         inputs=[
+            #             self.params, 
+            #             wp.array(self.cell_slice_map, dtype=int),
+            #             wp.array(self.concrete_indices, dtype=int),
+            #             self.n_concrete,
+            #             self.E_array,
+            #             200.0e9,
+            #             wp.array(self.rebar_indices, dtype=int)
+            #         ]
+            #     )
+            with self.tape:
+                wp.launch(
+                    kernel=map_slices_to_cells2,
+                    dim=max(self.n_concrete, self.n_rebar), # Launch for the larger set
+                    inputs=[
+                        self.params, 
+                        wp.array(self.concrete_indices, dtype=int),
+                        wp.array(self.rebar_indices, dtype=int),
+                        self.cell_slice_map_concrete,
+                        self.cell_slice_map_rebar,
+                        self.E_array,
+                        self.Nx,        # n_slices
+                        self.n_concrete,
+                        self.n_rebar,
+                        self.freeze_rebar,
+                        200.0e9         # rebar_static_val
+                    ]
+                )
+        else:
+            if not self.freeze_rebar:
+                with self.tape:
+                    wp.launch(
+                        kernel=map_rebar,
+                        dim=max(self.n_concrete, self.n_rebar), # Launch for the larger set
+                        inputs=[
+                            self.params, 
+                            wp.array(self.concrete_indices, dtype=int),
+                            wp.array(self.rebar_indices, dtype=int),
+                            self.cell_slice_map_concrete,
+                            self.cell_slice_map_rebar,
+                            self.E_array,
+                            self.Nx,        # n_slices
+                            self.n_concrete,
+                            self.n_rebar,
+                            self.freeze_rebar,
+                            200.0e9,         # rebar_static_val
+                        ]
+                    )
 
         self._E_field = fem.make_discrete_field(space=self.E_space)
         self._E_field.dof_values = self.E_array
@@ -395,9 +582,14 @@ class Example:
                 loss_form,
                 # loss_disp,
                 fields={"u": self._u_field, "u_meas": self._u_field_meas},
-                values={"mask": self.ab_mask},
+                values={
+                    "mask": self.ab_mask, 
+                    "strain_meas_arr": self.strain_meas, 
+                    "strain_est": self.strain_est,
+                    "sensor_positions": self.positions_sensors
+                    },
                 domain=self.cells,
-                # quadrature=fem.PicQuadrature(self.cells, self.positions_sensors),
+                quadrature=fem.PicQuadrature(self.cells, self.positions_sensors),
                 output=loss,
             )
 
@@ -405,16 +597,29 @@ class Example:
         self.tape.backward(loss=loss)
 
         # update positions and reset self.tape
-        grad = -self.E_array.grad.numpy()
-        # grad[self.rebar_indices] = 0.0
-        
-        self.optimizer.step([wp.array(grad, dtype=wp.float32)])
+        if not self.opt_slice:
+            if self.freeze_rebar:
+                grad = -self.E_array.grad.numpy()
+                grad[self.rebar_indices] = 0.0
+                # self.optimizer.step([wp.array(grad, dtype=wp.float32)])
+            else:
+                grad = -self.params.grad
+            self.optimizer.step([wp.array(grad, dtype=wp.float32)])
         # self.optimizer.step([-self.params.grad])
-        
-        self.tape.zero()
-        # print(loss.numpy().tolist(), grad)
-        # print(self.params.numpy().min(), self.params.numpy().max())
+        else:
+            grad = -self.params.grad
+            self.optimizer.step([wp.array(grad, dtype=wp.float32)])
 
+        wp.launch(
+            kernel=clip_params_kernel,
+            dim=len(self.params),
+            inputs=[self.params, 0.0] 
+        )
+
+        self.tape.zero()
+        # print(loss.numpy(), self.params.numpy().min(), self.params.numpy().max())#.tolist(), grad)
+        # print(self.params.numpy().min(), self.params.numpy().max())
+        # print(grad)
         self.strain_field = self.strain_space_meas.make_field()
         fem.interpolate(
                 strain_field,
@@ -422,33 +627,48 @@ class Example:
                 fields={"u": self._u_field},
                 # at=fem.NodalQuadrature(fem.Cells(self._geo), self._u_space)
             )
+        self.E_hist.append(self._E_field.dof_values.numpy().tolist())
+        return loss.numpy().tolist(), self.E_array.numpy().tolist(), self.strain_est.numpy().tolist()
 
-        return loss.numpy().tolist(), self.E_array.numpy().tolist()
+import argparse
+# Parse command-line arguments
+parser = argparse.ArgumentParser()
+parser.add_argument("specimen", type=str)
+parser.add_argument("loadstep", type=str)
+parser.add_argument("freeze_rebar", type=str)
+parser.add_argument("opt_slice", type=str)
+parser.add_argument("lr", type=str)
+parser.add_argument("step", type=str)
 
-# import argparse
-# # Parse command-line arguments
-# parser = argparse.ArgumentParser()
-# parser.add_argument("specimen", type=str)
-# parser.add_argument("loadstep", type=str)
-
-# args = parser.parse_args()
-
-# speciman = args.obs
-# loadstep = args.snapshot
-
-specimen = "1"
-loadstep = "1"
+args = parser.parse_args()
+print(args)
+specimen = args.specimen
+loadstep = args.loadstep
+freeze_rebar = bool(int(args.freeze_rebar))
+opt_slice = bool(int(args.opt_slice))
+lr = int(float(args.lr))
+step = int(float(args.step))
+# freeze_rebar = False
+# opt_slice = True
+# specimen = "1"
+# loadstep = "1"
 gauge_pitch = 0.0013 # mm
 # load target
-strain_meas_l = np.load(f'rebar_strains/s{specimen}_ls{loadstep}_l.npy', allow_pickle=True)
-strain_meas_r = np.load(f'rebar_strains/s{specimen}_ls{loadstep}_r.npy', allow_pickle=True)
+# strain_meas_l = np.load(f'rebar_strains/s{specimen}_ls{loadstep}_l.npy', allow_pickle=True)
+# strain_meas_r = np.load(f'rebar_strains/s{specimen}_ls{loadstep}_r.npy', allow_pickle=True)
+# strain_meas = (strain_meas_l + strain_meas_r) *1e-6 / 2 
 
-strain_meas = (strain_meas_l + strain_meas_r) *1e-6 / 2 
+print('loading target')
+strain_meas = np.load(f'rebar_strains/s{specimen}_ls{loadstep}_combined.npy', allow_pickle=True) * 1e-6
 strain_meas_x = np.arange(len(strain_meas)) * gauge_pitch
 # calculate load
-loads = np.array([22.2, 44.5, 89.0, 133.5, 177.9, 222.4]) * 1000
-load = loads[int(loadstep)]
+if specimen in ['1', '2', '3']:
+    loads = np.array([22.2, 44.5, 89.0, 89.0, 133.5, 177.9]) * 1000
+else:
+    loads = np.array([22.2, 44.5, 89.0, 133.5, 177.9, 222.4]) * 1000
+load = loads[int(loadstep) - 1]
 
+print('initializing Warp')
 with wp.ScopedDevice("cuda:0"):
     
     example = Example(
@@ -459,19 +679,23 @@ with wp.ScopedDevice("cuda:0"):
         poisson_ratio=0.3,
         load=wp.vec3(load/0.000509, 0.0, 0.0),
         # load=wp.vec3(200.0e3/0.000509, 0.0, 0.0),
-        lr=1.0e8,
+        lr=lr,
         strain_meas = strain_meas,
-        strain_meas_x = strain_meas_x
+        strain_meas_x = strain_meas_x,
+        freeze_rebar = freeze_rebar,
+        opt_slice = opt_slice,
     )
 
     losses = []
     params = []
-    n_its = 500
+    strains = []
+    n_its = step
     from tqdm import tqdm
     for _ in tqdm(np.arange(n_its)):
-        loss, param = example.step()
+        loss, param, strain = example.step()
         losses.append(loss)
         params.append(param)
+        strains.append(strain)
 
 
 
@@ -485,6 +709,7 @@ disp_est = example._u_field.dof_values.numpy()
 
 best_index = np.argmin(losses)
 E_best = params[best_index]
+strain_best = strains[best_index]
 
 node_positions = example._u_space.node_positions().numpy()
 E_meas = example._E_field_meas.dof_values.numpy()
@@ -499,7 +724,6 @@ E_max = np.max((np.max(E_meas), np.max(E_est), np.max(example.init_E)))
 
 node_positions = example._u_space.node_positions().numpy()
 disp_meas = example._u_field_meas.dof_values.numpy()
-strain_meas = example.strain_field_meas.dof_values.numpy()
 strain_res  = example.strain_field.dof_values.numpy()  
 
 node_positions = example._u_space.node_positions().numpy()
@@ -511,12 +735,47 @@ E = np.mean(E_meas)
 L = 1.0
 dx = L / 100
 theoretical_strain = P / (A * E)
-theoretical_displacement = P * 1 / (A*E)
-theoretical_displacement_rebar = P * 1 / (((0.0713-0.0487)**2)*200e9)
-measured_strain = strain_meas[:, 0, 0]
+theoretical_displacement = P * 1 / (((0.0713-0.0487)**2)*200e9 + ((A-((0.0713-0.0487)**2))*25e9))
+theoretical_displacement_rebar = P * 1 / (((0.0713-0.0487)**2.0)*200e9)
+measured_strain = strain_res[:, 0, 0]
 
 lo = int(measured_strain.shape[0]*3/8)
 hi = int(measured_strain.shape[0]*5/8)
+
+end_node_mask = node_positions[:, 0] > 0.999
+y = node_positions[:, 1]
+z = node_positions[:, 2]
+rebar_mask = (
+    (y >= 0.0486) & (y <= 0.0713) &
+    (z >= 0.0486) & (z <= 0.0713)
+)
+
+counts = np.unique_counts(E_est)
+print('counts',np.max(counts.counts), counts.values[np.argmax(counts.counts)])
+
+actual_disp_end = np.mean(disp_meas[rebar_mask, 0][-4:])
+integrated_strain = strain_res[rebar_mask,0,0].sum()*dx/4
+
+print(f"Theoretical Displacement at end (concrete and rebar): {theoretical_displacement:.6e}")
+print(f"Theoretical Displacement at end (rebar only): {theoretical_displacement_rebar:.6e}")
+print(f"Simulated Displacement at end (u_L): {actual_disp_end:.6e}")
+print(f"Simulated Integrated strain (sum(epsilon) * dx): {integrated_strain:.6e}")
+print(f"Measured Integrated strain (sum(epsilon) * dx): {strain_meas.sum()*0.0013:.6e}")
+# print(f"Difference: {abs(actual_disp_end - integrated_strain):.6e}")
+# print(example.strain_est.numpy().shape)
+# print(example.positions_sensors_np.shape)
+
+x_s = example.positions_sensors_np[:, 0]
+x_s_rounded = np.round(x_s, decimals=6)
+
+x_s_unique = np.unique(x_s_rounded)
+eps_est_avg = []
+
+for xi in x_s_unique:
+    mask_x = x_s_rounded == xi
+    eps_est_avg.append(np.mean(np.array(strain_best)[mask_x]))
+eps_est_avg = np.array(eps_est_avg)
+
 
 end_node_mask = node_positions[:, 0] > 0.999
 x = node_positions[:, 0]
@@ -527,46 +786,19 @@ rebar_mask = (
     (z >= 0.0486) & (z <= 0.0713)
 )
 x_rb = x[rebar_mask]
-eps_xx_meas = strain_meas[:, 0, 0]
 eps_xx_res  = strain_res[:, 0, 0]
-eps_meas_rb = eps_xx_meas[rebar_mask]
 eps_res_rb  = eps_xx_res[rebar_mask]
 x_rounded = np.round(x_rb, decimals=6)
 
 x_unique = np.unique(x_rounded)
 
-eps_meas_avg = []
 eps_res_avg = []
 
 for xi in x_unique:
     mask_x = x_rounded == xi
-    eps_meas_avg.append(np.mean(eps_meas_rb[mask_x]))
     eps_res_avg.append(np.mean(eps_res_rb[mask_x]))
 
-eps_meas_avg = np.array(eps_meas_avg)
 eps_res_avg  = np.array(eps_res_avg)
-
-print(theoretical_strain)
-print(np.mean(measured_strain), np.median(measured_strain))
-print(np.mean(measured_strain[lo:hi]))
-print(theoretical_displacement)
-print(disp_meas[-30:,0])
-print(strain_meas[:,0,0].sum()*dx/4)
-print(node_positions.shape)
-print(disp_meas.shape)
-print(strain_meas.shape)
-print(sum(rebar_mask))
-
-
-actual_disp_end = np.mean(disp_meas[rebar_mask, 0][-4:])
-integrated_strain = strain_meas[rebar_mask,0,0].sum()*dx/4
-
-print(f"Theoretical Displacement at end (concrete and rebar): {theoretical_displacement:.6e}")
-print(f"Theoretical Displacement at end (rebar only): {theoretical_displacement_rebar:.6e}")
-print(f"Simulated Displacement at end (u_L): {actual_disp_end:.6e}")
-print(f"Simulated Integrated strain (sum(epsilon) * dx): {integrated_strain:.6e}")
-print(f"Measured Integrated strain (sum(epsilon) * dx): {strain_meas.sum()*0.0013:.6e}")
-# print(f"Difference: {abs(actual_disp_end - integrated_strain):.6e}")
 
 import matplotlib.pyplot as plt
 fig, axes = plt.subplots(3, 1, figsize=(16, 16))
@@ -587,27 +819,104 @@ ax.set_xlabel('Iterations')
 ax.set_ylabel('E')
 ax.set_title('Adam Learning Curve')
 result_dict = {
-        "E_hist" : params,
+        "E_hist" : example.E_hist,
         "losses" : losses,
     }
-exp_name = f"3d_prism_uniform"
+exp_name = f"3d_prism_nonzero_s{specimen}_ls{loadstep}_freeze_{freeze_rebar}_slice_{opt_slice}_lr_{lr}_steps_{step}"
 with open(f"results/{exp_name}.json", "w") as outfile: 
     json.dump(result_dict, outfile)
 
 ax = axes[2]
-ax.plot(x_unique, eps_meas_avg, label="Measured strain", lw=2)
-ax.plot(x_unique, eps_res_avg,  label="Estimated strain", lw=2, linestyle="--")
+ax.plot(strain_meas_x, strain_meas, label="Measured strain", lw=2)
+ax.plot(x_s_unique, eps_est_avg,  label="Estimated strain", lw=2, linestyle="--")
+ax.hlines(theoretical_displacement_rebar, 0, 1, color='r', label="Theoretical Max Rebar Strain")
+ax.hlines(theoretical_displacement, 0, 1, color='0.5', label="Theoretical Min Combined Strain")
 ax.set_xlabel("x")
 ax.set_ylabel(r"$\varepsilon_{xx}$")
 ax.set_title("Longitudinal strain in rebar (y–z averaged)")
 ax.legend()
 
-plt.savefig(f"figures/{exp_name}.png", dpi=300)
-plt.show()
+plt.savefig(f"figures/3d_prism_nonzero/{exp_name}.png", dpi=300)
+# plt.show()
+
+
+# # Get data
+# node_positions = example._u_space.node_positions().numpy()
+# disp_meas = example._u_field_meas.dof_values.numpy()
+# disp_est = example._u_field.dof_values.numpy()
+# # strain_meas = example.strain_field_meas.dof_values.numpy()
+# # strain_est = example.strain_field.dof_values.numpy()
+
+# best_index = np.argmin(losses)
+# E_best = params[best_index]
+
+# node_positions = example._u_space.node_positions().numpy()
+# E_meas = example._E_field_meas.dof_values.numpy()
+# E_est = example._E_field.dof_values.numpy()
+
+# disp_min = np.min((np.min(disp_meas[:,0]), np.min(disp_est[:,0])))
+# disp_max = np.max((np.max(disp_meas[:,0]), np.max(disp_est[:,0])))
+# # strain_min = np.min((np.min(strain_meas[:,0,0]), np.min(strain_est[:,0,0])))
+# # strain_max = np.max((np.max(strain_meas[:,0,0]), np.max(strain_est[:,0,0])))
+# E_min = np.min((np.min(E_meas), np.min(E_est), np.min(example.init_E), np.min(E_best)))
+# E_max = np.max((np.max(E_meas), np.max(E_est), np.max(example.init_E)))
+
+# node_positions = example._u_space.node_positions().numpy()
+# disp_meas = example._u_field_meas.dof_values.numpy()
+# strain_meas = example.strain_field_meas.dof_values.numpy()
+
+
+# node_positions = example._u_space.node_positions().numpy()
+# E_meas = example._E_field_meas.dof_values.numpy()
+
+# P = load
+# A = example.resolution[1] * example.resolution[2]
+# E = np.mean(E_meas)
+# L = 1.0
+# dx = L / 100
+# theoretical_strain = P / (A * E)
+# theoretical_displacement = P * 1 / (A*E)
+# theoretical_displacement_rebar = P * 1 / (((0.0713-0.0487)**2)*200e9)
+# measured_strain = strain_meas[:, 0, 0]
+
+# lo = int(measured_strain.shape[0]*3/8)
+# hi = int(measured_strain.shape[0]*5/8)
+
+# end_node_mask = node_positions[:, 0] > 0.999
+# y = node_positions[:, 1]
+# z = node_positions[:, 2]
+# rebar_mask = (
+#     (y >= 0.0486) & (y <= 0.0713) &
+#     (z >= 0.0486) & (z <= 0.0713)
+# )
+
+# print(theoretical_strain)
+# print(np.mean(measured_strain), np.median(measured_strain))
+# print(np.mean(measured_strain[lo:hi]))
+# print(theoretical_displacement)
+# print(disp_meas[-30:,0])
+# print(strain_meas[:,0,0].sum()*dx/4)
+# print(node_positions.shape)
+# print(disp_meas.shape)
+# print(strain_meas.shape)
+# print(sum(rebar_mask))
+
+
+# actual_disp_end = np.mean(disp_meas[rebar_mask, 0][-4:])
+# integrated_strain = strain_meas[rebar_mask,0,0].sum()*dx/4
+
+# print(f"Theoretical Displacement at end (concrete and rebar): {theoretical_displacement:.6e}")
+# print(f"Theoretical Displacement at end (rebar only): {theoretical_displacement_rebar:.6e}")
+# print(f"Simulated Displacement at end (u_L): {actual_disp_end:.6e}")
+# print(f"Simulated Integrated strain (sum(epsilon) * dx): {integrated_strain:.6e}")
+# print(f"Measured Integrated strain (sum(epsilon) * dx): {strain_meas.sum()*0.0013:.6e}")
+# # print(f"Difference: {abs(actual_disp_end - integrated_strain):.6e}")
+
+
 
 
 vmin = E_min
-vmax = E_max
+vmax = 27.0e9
 
 import pyvista
 
@@ -623,26 +932,67 @@ grid.cell_data["values"] = E_meas
 plotter.add_mesh(grid, clim=[vmin, vmax], show_edges=True)
 plotter.add_title("True Elastic Field")
 plotter.show_axes()
-plotter.show(screenshot=f"figures/{exp_name}_meas.png", window_size=(1800,1200))
+# plotter.show(screenshot=f"figures/{exp_name}_meas.png", window_size=(1800,1200))
 
-plotter = pyvista.Plotter(off_screen=True,)
-grid.cell_data["values"] = E_est
-plotter.add_mesh(grid, clim=[vmin, vmax], show_edges=True)
-plotter.add_title("Estimated Elastic Field")
-plotter.show_axes()
-plotter.show(screenshot=f"figures/{exp_name}_est.png", window_size=(1800,1200))
+# plotter = pyvista.Plotter(off_screen=True,)
+# grid.cell_data["values"] = E_est
+# plotter.add_mesh(grid, clim=[vmin, vmax], show_edges=True)
+# plotter.add_title("Estimated Elastic Field")
+# plotter.show_axes()
+# plotter.show(screenshot=f"figures/{exp_name}_est.png", window_size=(1800,1200))
 
-plotter = pyvista.Plotter(off_screen=True,)
+# plotter = pyvista.Plotter(off_screen=True,)
+# grid.cell_data["values"] = E_best
+# plotter.add_mesh(grid, clim=[vmin, vmax], show_edges=True)
+# plotter.add_title("Best Estimated Elastic Field")
+# plotter.show_axes()
+# plotter.show(screenshot=f"figures/{exp_name}_best.png", window_size=(1800,1200))
+
+# plotter = pyvista.Plotter(off_screen=True,)
+# grid.cell_data["values"] = example.init_E
+# plotter.add_mesh(grid, clim=[vmin, vmax], show_edges=True)
+# plotter.add_title("Initial Elastic Field")
+# plotter.show_axes()
+# plotter.show(screenshot=f"figures/{exp_name}_init.png", window_size=(1800,1200))
+
 grid.cell_data["values"] = E_best
-plotter.add_mesh(grid, clim=[vmin, vmax], show_edges=True)
-plotter.add_title("Best Estimated Elastic Field")
-plotter.show_axes()
-plotter.show(screenshot=f"figures/{exp_name}_best.png", window_size=(1800,1200))
+centers = grid.cell_centers().points
+x = centers[:,0]
+y = centers[:,1]
+z = centers[:,2]
 
-plotter = pyvista.Plotter(off_screen=True,)
-grid.cell_data["values"] = example.init_E
-plotter.add_mesh(grid, clim=[vmin, vmax], show_edges=True)
-plotter.add_title("Initial Elastic Field")
-plotter.show_axes()
-plotter.show(screenshot=f"figures/{exp_name}_init.png", window_size=(1800,1200))
+z_unique = np.unique(z)
 
+
+fig, axes = plt.subplots(len(z_unique)+1, 1, figsize=(12, 12), layout='constrained')
+scatter_list = []
+
+# Plot the X-Y slices for each z
+for i, zi in enumerate(z_unique):
+    mask = z == zi
+    E_val = grid.cell_data["values"][mask]
+    coords = centers[mask][:, :2]
+
+    ax = axes[i]
+    ax.set_xlabel('x')
+    ax.set_ylabel('y')
+    scatter = ax.scatter(coords[:, 0], coords[:, 1], c=E_val, cmap='jet', vmin=vmin, vmax=vmax)
+    scatter_list.append(scatter)
+
+# Add a single horizontal colorbar on top of the figure
+cbar = fig.colorbar(scatter_list[0], ax=axes[:len(z_unique)], orientation='horizontal', pad=0.01, aspect=50)
+cbar.set_label("Young's Modulus (Pa)")
+
+# Plot longitudinal strain in the bottom subplot
+ax = axes[len(z_unique)]
+ax.plot(strain_meas_x, strain_meas, label="Measured strain", lw=2)
+ax.plot(x_s_unique, eps_est_avg, label="Estimated strain", lw=2, linestyle="--")
+ax.hlines(theoretical_displacement_rebar, 0, 1, color='r', label="Theoretical Max Rebar Strain")
+ax.hlines(theoretical_displacement, 0, 1, color='0.5', label="Theoretical Min Combined Strain")
+ax.set_xlabel("x")
+ax.set_ylabel(r"$\varepsilon_{xx}$")
+ax.set_title("Longitudinal strain in rebar (y–z averaged)")
+ax.legend()
+
+plt.savefig(f"figures/3d_prism_nonzero/{exp_name}_slices.png", dpi=300)
+# plt.show()
