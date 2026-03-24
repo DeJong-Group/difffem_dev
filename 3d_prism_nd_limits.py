@@ -8,10 +8,77 @@ from warp.optim import Adam
 import json
 
 @wp.kernel
-def clip_params_kernel(params: wp.array(dtype=float), lower_bound: float):
+def clip_params_kernel(
+    params: wp.array(dtype=float),
+    concrete_indices: wp.array(dtype=int),
+    rebar_indices: wp.array(dtype=int),
+    cell_slice_map_concrete: wp.array(dtype=int),
+    cell_slice_map_rebar: wp.array(dtype=int),
+    full_E_field: wp.array(dtype=float),
+    n_slices: int,
+    n_concrete: int,
+    n_rebar: int,
+    freeze_rebar: bool,
+    rebar_static_val: float,
+    c_min: float,
+    c_max: float,
+    r_min: float,
+    r_max: float
+):
     tid = wp.tid()
-    if params[tid] < lower_bound:
-        params[tid] = lower_bound
+    
+    if opt_slice:
+        if tid < n_concrete:
+            c_idx = concrete_indices[tid]
+            s_idx = cell_slice_map_concrete[tid]
+            # Concrete parameters are in the first track: [0 : n_slices]
+            val = params[s_idx]
+            if val < c_min:
+                params[s_idx] = c_min
+            elif val > c_max:
+                params[s_idx] = c_max
+            full_E_field[c_idx] = params[s_idx]
+            
+        # Map Rebar Slices
+        if tid < n_rebar:
+            r_idx = rebar_indices[tid]
+            if freeze_rebar:
+                full_E_field[r_idx] = rebar_static_val
+            else:
+                # s_idx = cell_slice_map_rebar[tid]
+                # Rebar parameters are in the second track: [n_slices : 2*n_slices]
+                val = params[n_slices]
+                if val < r_min:
+                    params[n_slices] = r_min
+                elif val > r_max:
+                    params[n_slices] = r_max
+                full_E_field[r_idx] = params[n_slices]
+    else:
+        if tid < n_concrete:
+            c_idx = concrete_indices[tid]
+            s_idx = cell_slice_map_concrete[tid]
+            # Concrete parameters are in the first track: [0 : n_slices]
+            val = params[s_idx]
+            if val < c_min:
+                params[s_idx] = c_min
+            elif val > c_max:
+                params[s_idx] = c_max
+            full_E_field[c_idx] = params[s_idx]
+
+        # Map Rebar Slices
+        if tid < n_rebar:
+            r_idx = rebar_indices[tid]
+            if freeze_rebar:
+                full_E_field[r_idx] = rebar_static_val
+            else:
+                # s_idx = cell_slice_map_rebar[tid]
+                # Rebar parameters are in the second track: [n_slices : 2*n_slices]
+                if val < r_min:
+                    params[n_concrete] = r_min
+                elif val > r_max:
+                    params[n_concrete] = r_max
+                full_E_field[r_idx] = params[n_concrete]
+
 
 @wp.kernel
 def map_slices_to_cells2(
@@ -236,6 +303,8 @@ class Example:
         mesh="tri",
         poisson_ratio=0.3,
         E=25.0e9,
+        c_lim=(1000.0, 25.0e9*1.1),
+        r_lim=(200.0e9*0.9, 200.0e9*1.1),
         load=(1.0, 0.0, 0.0),
         lr=1.0e-3,
         strain_meas = None,
@@ -256,6 +325,7 @@ class Example:
         bounds_hi = wp.vec3(1.0, 0.12, 0.12)
         self._initial_volume = (bounds_hi - bounds_lo)[0] * (bounds_hi - bounds_lo)[1] * (bounds_hi - bounds_lo)[2]
         
+
         # optimization settings
         self.freeze_rebar = freeze_rebar
         self.opt_slice = opt_slice
@@ -293,6 +363,8 @@ class Example:
         self.positions_sensors_np = np.transpose(np.meshgrid(strain_meas_x, target_vals, target_vals, indexing="ij"), axes=(1, 2, 3, 0)).reshape(-1, 3)
         self.positions_sensors = wp.array(self.positions_sensors_np, dtype=wp.vec3, requires_grad=True)
 
+        self.c_lim = c_lim
+        self.r_lim = r_lim
         # --- DIC Data Processing ---
         def prep_dic(x_grid, y_grid, exx_data, z_val):
             pts = np.stack([x_grid.flatten(), y_grid.flatten(), np.full_like(x_grid.flatten(), z_val)], axis=-1)
@@ -469,12 +541,21 @@ class Example:
         self.init_E[self.rebar_indices] = 200.0e9
         self.E_array = wp.array(self.init_E, dtype=float, requires_grad=True)
         self.E_hist = []
+
+
+
         if not self.opt_slice:
+            all_cells = np.arange(self._geo.cell_count())
+            self.concrete_indices = np.delete(all_cells, self.rebar_indices)
+            self.n_concrete = len(self.concrete_indices)
+            self.cell_slice_map_concrete = wp.array(np.arange(self.n_concrete), dtype=int)
+            self.cell_slice_map_rebar = wp.array((self.rebar_indices // (self.Ny * self.Nz)).astype(int), dtype=int)
+            self.n_concrete = len(self.concrete_indices)
+            self.n_rebar = len(self.rebar_indices)
             if self.freeze_rebar:
                 self.params = wp.array(self.E_array, dtype=wp.float32).flatten()
                 self.params.grad = wp.array(self.E_array.grad, dtype=wp.float32).flatten()
             else:
-                self.num_slices = self.Nx 
                 all_cells = np.arange(self._geo.cell_count())
                 self.concrete_indices = np.delete(all_cells, self.rebar_indices)
                 self.n_concrete = len(self.concrete_indices)
@@ -512,20 +593,6 @@ class Example:
     def step(self):
         self.tape = wp.Tape()
         if self.opt_slice:
-            # with self.tape:
-            #     wp.launch(
-            #         kernel=map_slices_to_cells,
-            #         dim=self._geo.cell_count(),
-            #         inputs=[
-            #             self.params, 
-            #             wp.array(self.cell_slice_map, dtype=int),
-            #             wp.array(self.concrete_indices, dtype=int),
-            #             self.n_concrete,
-            #             self.E_array,
-            #             200.0e9,
-            #             wp.array(self.rebar_indices, dtype=int)
-            #         ]
-            #     )
             with self.tape:
                 wp.launch(
                     kernel=map_slices_to_cells2,
@@ -676,12 +743,26 @@ class Example:
 
         wp.launch(
             kernel=clip_params_kernel,
-            dim=len(self.params),
-            inputs=[self.params, 1000.0] 
+            dim=max(self.n_concrete, self.n_rebar),
+            inputs=[
+                self.params, 
+                wp.array(self.concrete_indices, dtype=int),
+                wp.array(self.rebar_indices, dtype=int),
+                self.cell_slice_map_concrete,
+                self.cell_slice_map_rebar,
+                self.E_array,
+                self.Nx,        # n_slices
+                self.n_concrete,
+                self.n_rebar,
+                self.freeze_rebar,
+                200.0e9,         # rebar_static_val
+                self.c_lim[0], self.c_lim[1], 
+                self.r_lim[0], self.r_lim[1]
+            ]
         )
 
         self.tape.zero()
-        # print(loss.numpy(), self.params.numpy().min(), self.params.numpy().max())#.tolist(), grad)
+        print(loss.numpy(), self.params.numpy().min(), self.params.numpy().max())#.tolist(), grad)
         # print(loss.numpy(), self.params.numpy().min(), self.params.numpy().max())
         # print(grad)
         self.strain_field = self.strain_space_meas.make_field()
@@ -747,13 +828,17 @@ A_x, A_y = np.meshgrid(A_x, A_y)
 B_x = np.linspace(0,1,Exx_B.shape[1], endpoint=True)
 B_y = np.linspace(0,0.12,Exx_B.shape[0], endpoint=True)
 B_x, B_y = np.meshgrid(B_x, B_y)
-
+print(Exx_A.shape, Exx_B.shape, strain_meas_x.shape)
 # calculate load
 if specimen in ['1', '2', '3']:
     loads = np.array([22.2, 44.5, 89.0, 89.0, 133.5, 177.9]) * 1000
 else:
     loads = np.array([22.2, 44.5, 89.0, 133.5, 177.9, 222.4]) * 1000
 load = loads[int(loadstep) - 1]
+
+prev_loss = None
+ftol = 1e-16  # Tolerance for relative change
+
 
 print('initializing Warp')
 with wp.ScopedDevice("cuda:0"):
@@ -781,12 +866,47 @@ with wp.ScopedDevice("cuda:0"):
     strains = []
     n_its = step
     from tqdm import tqdm
-    # for _ in tqdm(np.arange(n_its)):
-    for _ in range(n_its):
+    from collections import deque
+
+    # Settings
+    window_size = 100
+    loss_window = deque(maxlen=window_size)
+    prev_avg_loss = None
+
+    for i in tqdm(range(n_its)):
         loss, param, strain = example.step()
-        losses.append(loss)
+        
+        # Store current loss (assuming loss is a list/array [val])
+        current_loss_val = loss[0]
+        losses.append(current_loss_val)
         params.append(param)
         strains.append(strain)
+
+        # Add to rolling window
+        loss_window.append(current_loss_val)
+
+        # Only check convergence once the window is full
+        if len(loss_window) == window_size:
+            current_avg_loss = np.mean(loss_window)
+
+            if prev_avg_loss is not None:
+                # Convergence Formula: (f_avg^k - f_avg^{k+1}) / max(|f_avg^k|, |f_avg^{k+1}|, 1e-6)
+                diff = np.abs(prev_avg_loss - current_avg_loss)
+                denom = np.max([np.abs(prev_avg_loss), np.abs(current_avg_loss), 1e-6])
+                rel_change = diff / denom
+                
+                if rel_change <= ftol:
+                    print(f"\nConverged (Moving Average) at iteration {i}: "
+                        f"Rel Change {rel_change:.2e} <= {ftol}")
+                    n_its = i + 1
+                    break
+            
+            # Update the reference average for the next iteration
+            prev_avg_loss = current_avg_loss
+
+    # Ensure n_its is updated if we finish the loop without breaking
+    else:
+        n_its = len(losses)
 
 
 
@@ -913,7 +1033,7 @@ result_dict = {
         "E_hist" : example.E_hist,
         "losses" : losses,
     }
-exp_name = f"3d_prism_n_DIC_s{specimen}_ls{loadstep}_weights_{[str(i) for i in weights]}_freeze_{freeze_rebar}_slice_{opt_slice}_lr_{lr}_steps_{step}"
+exp_name = f"3d_prism_nd_limits_s{specimen}_ls{loadstep}_weights_{[str(i) for i in weights]}_freeze_{freeze_rebar}_slice_{opt_slice}_lr_{lr}_steps_{step}"
 with open(f"results/{exp_name}.json", "w") as outfile: 
     json.dump(result_dict, outfile)
 
@@ -927,7 +1047,7 @@ ax.set_ylabel(r"$\varepsilon_{xx}$")
 ax.set_title("Longitudinal strain in rebar (y–z averaged)")
 ax.legend()
 
-plt.savefig(f"figures/3d_prism_n_DIC/{exp_name}_LC.png", dpi=300)
+plt.savefig(f"figures/3d_prism_nd_limits/{exp_name}_LC.png", dpi=300)
 # plt.show()
 
 
@@ -1098,7 +1218,7 @@ ax.legend()
 
     
 
-plt.savefig(f"figures/3d_prism_n_DIC/{exp_name}_E.png", dpi=300)
+plt.savefig(f"figures/3d_prism_nd_limits/{exp_name}_E.png", dpi=300)
 
 
 
@@ -1225,4 +1345,4 @@ ax.set_ylabel(r"$\varepsilon_{xx}$")
 ax.set_title("Longitudinal strain in rebar (y–z averaged)")
 ax.legend()
 
-plt.savefig(f"figures/3d_prism_n_DIC/{exp_name}_strain.png", dpi=300)
+plt.savefig(f"figures/3d_prism_nd_limits/{exp_name}_strain.png", dpi=300)
