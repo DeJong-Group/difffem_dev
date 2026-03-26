@@ -11,12 +11,17 @@ loadsteps = [str(i) for i in np.arange(1)+1]
 freeze_rebars = ['0', '1']
 opt_slices = ['0', '1']
 weightss = [
-    ['0.0', '1.0', '0.0'],
-    ['0.0', '0.0', '1.0'],
+    # ['0.0', '1.0', '0.0'],
+    # ['0.0', '0.0', '1.0'],
     ['1.0', '0.0', '0.0'],
     ['0.0', '1.0', '1.0'],
     ['1.0', '1.0', '1.0'],
     ['4500.0', '1.0', '1.0']
+]
+datas = [
+    'rcrt_adjust',
+    'rcrta_smooth',
+    'rcrtas_bump',
 ]
 
 lrs = [str(i) for i in [1e8, 1e7, 1e6]]
@@ -28,14 +33,14 @@ steps = [str(i) for i in [2000, 500, 250]]
 # loadsteps = ['1']
 # freeze_rebars = ['1']
 # opt_slices = ['0']
-weightss = [['0.0', '1.0', '0.0']]
+# weightss = [['0.0', '1.0', '0.0']]
 
 # The target script name
 target_script_damaged = "3d_prism_nd_limits.py"
 max_concurrent_processes = 3
 
-def run_if_not_found(semaphore, specimen, loadstep, freeze_rebar, opt_slice, lrs, weights, steps):
-    exp_name = f"3d_prism_nd_limits_s{specimen}_ls{loadstep}_weights_{weights}_freeze_{bool(int(freeze_rebar))}_slice_{bool(int(opt_slice))}"
+def run_if_not_found(semaphore, specimen, loadstep, freeze_rebar, opt_slice, lrs, weights, steps, data):
+    exp_name = f"3d_prism_nd_limits_s{specimen}_ls{loadstep}_weights_{weights}_freeze_{bool(int(freeze_rebar))}_slice_{bool(int(opt_slice))}_{data}"
     w_rebar = weights[0]
     w_A = weights[1]
     w_B = weights[2]
@@ -89,12 +94,12 @@ def run_if_not_found(semaphore, specimen, loadstep, freeze_rebar, opt_slice, lrs
 #                     print(f"Error running script: {e}")
 
 if __name__ == "__main__":
-    combinations = list(itertools.product(specimens, loadsteps, freeze_rebars, opt_slices, weightss))
+    combinations = list(itertools.product(specimens, loadsteps, freeze_rebars, opt_slices, weightss, datas))
     semaphore = multiprocessing.Semaphore(max_concurrent_processes)
     # Launch a separate process for each combination
     processes = []
-    for specimen, loadstep, freeze_rebar, opt_slice, weights in combinations:
-        p = multiprocessing.Process(target=run_if_not_found, args=(semaphore, specimen, loadstep, freeze_rebar, opt_slice, lrs, weights, steps))
+    for specimen, loadstep, freeze_rebar, opt_slice, weights, data in combinations:
+        p = multiprocessing.Process(target=run_if_not_found, args=(semaphore, specimen, loadstep, freeze_rebar, opt_slice, lrs, weights, steps, data))
         # p = multiprocessing.Process(target=run_once, args=(semaphore, specimen, loadstep, freeze_rebar, opt_slice, lrs, steps))
         p.start()
         processes.append(p)

@@ -762,7 +762,7 @@ class Example:
         )
 
         self.tape.zero()
-        print(loss.numpy(), self.params.numpy().min(), self.params.numpy().max())#.tolist(), grad)
+        # print(loss.numpy(), self.params.numpy().min(), self.params.numpy().max())#.tolist(), grad)
         # print(loss.numpy(), self.params.numpy().min(), self.params.numpy().max())
         # print(grad)
         self.strain_field = self.strain_space_meas.make_field()
@@ -787,6 +787,7 @@ parser.add_argument("w_rebar", type=str)
 parser.add_argument("w_A", type=str)
 parser.add_argument("w_B", type=str)
 parser.add_argument("step", type=str)
+parser.add_argument("data", type=str)
 
 args = parser.parse_args()
 print(args)
@@ -801,6 +802,10 @@ weights = [
     float(args.w_B),
 ]
 step = int(float(args.step))
+if args.data == '':
+    data = 'rcrt_adjust'
+else:
+    data = args.data
 
 # freeze_rebar = False
 # opt_slice = True
@@ -818,8 +823,8 @@ strain_meas_x = np.arange(len(strain_meas)) * gauge_pitch
 
 if loadstep=='1':
     kips = '5'
-Exx_A = np.load(f'DIC/S{specimen}A_{kips}k_Exx_rcr_trim.npy')
-Exx_B = np.load(f'DIC/S{specimen}B_{kips}k_Exx_rcr_trim.npy')
+Exx_A = np.load(f'DIC/S{specimen}A_{kips}k_Exx_{data}.npy')
+Exx_B = np.load(f'DIC/S{specimen}B_{kips}k_Exx_{data}.npy')
 
 A_x = np.linspace(0,1,Exx_A.shape[1], endpoint=True)
 A_y = np.linspace(0,0.12,Exx_A.shape[0], endpoint=True)
@@ -873,7 +878,8 @@ with wp.ScopedDevice("cuda:0"):
     loss_window = deque(maxlen=window_size)
     prev_avg_loss = None
 
-    for i in tqdm(range(n_its)):
+    # for i in tqdm(range(n_its)):
+    for i in range(n_its):
         loss, param, strain = example.step()
         
         # Store current loss (assuming loss is a list/array [val])
@@ -1033,7 +1039,7 @@ result_dict = {
         "E_hist" : example.E_hist,
         "losses" : losses,
     }
-exp_name = f"3d_prism_nd_limits_s{specimen}_ls{loadstep}_weights_{[str(i) for i in weights]}_freeze_{freeze_rebar}_slice_{opt_slice}_lr_{lr}_steps_{step}"
+exp_name = f"3d_prism_nd_limits_s{specimen}_ls{loadstep}_weights_{[str(i) for i in weights]}_freeze_{freeze_rebar}_slice_{opt_slice}_{data}_lr_{lr}_steps_{step}"
 with open(f"results/{exp_name}.json", "w") as outfile: 
     json.dump(result_dict, outfile)
 
