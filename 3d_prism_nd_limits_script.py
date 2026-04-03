@@ -21,7 +21,8 @@ weightss = [
 datas = [
     'rcrt_adjust',
     'rcrta_smooth',
-    'rcrtas_bump',
+    'rcrtas_curv',
+    # 'rcrtas_bump',
 ]
 
 lrs = [str(i) for i in [1e8, 1e7, 1e6]]
@@ -37,7 +38,7 @@ steps = [str(i) for i in [2000, 500, 250]]
 
 # The target script name
 target_script_damaged = "3d_prism_nd_limits.py"
-max_concurrent_processes = 3
+max_concurrent_processes = 5
 
 def run_if_not_found(semaphore, specimen, loadstep, freeze_rebar, opt_slice, lrs, weights, steps, data):
     exp_name = f"3d_prism_nd_limits_s{specimen}_ls{loadstep}_weights_{weights}_freeze_{bool(int(freeze_rebar))}_slice_{bool(int(opt_slice))}_{data}"
@@ -64,7 +65,8 @@ def run_if_not_found(semaphore, specimen, loadstep, freeze_rebar, opt_slice, lrs
                             w_rebar,
                             w_A,
                             w_B, 
-                            step], check=True)
+                            step,
+                            data,], check=True)
                     except subprocess.CalledProcessError as e:
                         print(f"Error running script: {e}")
                 else:

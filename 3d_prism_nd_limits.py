@@ -1352,3 +1352,55 @@ ax.set_title("Longitudinal strain in rebar (y–z averaged)")
 ax.legend()
 
 plt.savefig(f"figures/3d_prism_nd_limits/{exp_name}_strain.png", dpi=300)
+
+# --- SAVE DATA FOR PLOTTING ---
+import os
+
+# Create directory if it doesn't exist
+save_dir = "plot_data"
+if not os.path.exists(save_dir):
+    os.makedirs(save_dir)
+
+# Construct the filename (using the same exp_name used for figures)
+save_path = os.path.join(save_dir, f"{exp_name}_data.npz")
+
+np.savez(
+    save_path,
+    # Metadata/Arguments
+    metadata={
+        "specimen": specimen,
+        "loadstep": loadstep,
+        "freeze_rebar": freeze_rebar,
+        "opt_slice": opt_slice,
+        "lr": lr,
+        "weights": weights,
+        "load": load
+    },
+    # Optimization History
+    losses=np.array(losses),
+    params=np.array(params),
+    
+    # Experimental Data
+    strain_meas=strain_meas,
+    strain_meas_x=strain_meas_x,
+    Exx_A=Exx_A,
+    Exx_B=Exx_B,
+    
+    # Geometry and Fields
+    node_positions=node_positions,
+    E_best=E_best,
+    strain_best=strain_best,
+    strain_res=strain_res,
+    
+    # Processed plotting variables (averages/benchmarks)
+    x_s_unique=x_s_unique,
+    eps_est_avg=eps_est_avg,
+    theoretical_displacement=theoretical_displacement,
+    theoretical_displacement_rebar=theoretical_displacement_rebar,
+    
+    # Mesh data for PyVista
+    vtk_cells=cells,
+    vtk_types=types
+)
+
+print(f"\nPlotting data saved successfully to: {save_path}")
