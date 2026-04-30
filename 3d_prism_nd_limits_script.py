@@ -6,21 +6,25 @@ import multiprocessing
 import numpy as np
 
 # # Define the combinations
-specimens = [str(i) for i in np.arange(3)+1]
+specimens = [str(i) for i in np.arange(2)+1]
 loadsteps = [str(i) for i in np.arange(1)+1]
-freeze_rebars = ['0', '1']
+freeze_rebars = ['0']#, '1']
 opt_slices = ['0', '1']
 weightss = [
-    # ['0.0', '1.0', '0.0'],
+    ['0.0', '1.0', '0.0'],
     # ['0.0', '0.0', '1.0'],
-    ['1.0', '0.0', '0.0'],
-    ['0.0', '1.0', '1.0'],
-    ['1.0', '1.0', '1.0'],
-    ['4500.0', '1.0', '1.0']
+    # ['1.0', '0.0', '0.0'],
+    # ['0.0', '1.0', '1.0'],
+    # ['1.0', '1.0', '1.0'],
+    # ['4500.0', '1.0', '1.0'],
+    ['2500.0', '1.0', '1.0'],
+    ['1000.0', '1.0', '1.0'],
+    ['100.0', '1.0', '1.0'],
+    ['10.0', '1.0', '1.0'],
 ]
 datas = [
-    'rcrt_adjust',
-    'rcrta_smooth',
+    # 'rcrt_adjust',
+    # 'rcrta_smooth',
     'rcrtas_curv',
     # 'rcrtas_bump',
 ]

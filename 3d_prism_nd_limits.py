@@ -375,7 +375,7 @@ class Example:
         B_x, B_y = B_pos
 
         # Side A (Z=0)
-        self.pos_A, self.strain_A = prep_dic(A_x, A_y, Exx_A, 0.0)
+        self.pos_A, self.strain_A = prep_dic(A_x, A_y, Exx_A, 0.00)
         # Side B (Z=0.12)
         self.pos_B, self.strain_B = prep_dic(B_x, B_y, Exx_B, 0.12)
     
